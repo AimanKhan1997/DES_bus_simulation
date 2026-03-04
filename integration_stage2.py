@@ -7,7 +7,7 @@ import simpy
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Union
 from collections import defaultdict
 import heapq
 from dataclasses import dataclass
@@ -27,6 +27,10 @@ BUS_MIN_SOC = 0.20
 MAX_CONCURRENT_CHARGERS = 2
 CHARGER_SPEED_MS = 27.78
 ENERGY_PER_METER_WH = 2.7
+
+MAP_ENERGY_PER_METER_WH = 0.3       # MAP energy consumption per metre of travel (Wh/m)
+MAP_RECHARGE_RATE_WH_S = 233.33     # Rate at which idle MAPs self-recharge (Wh/s)
+MAP_BATTERY_CAPACITY_WH = 100000    # Default MAP battery capacity (100 kWh)
 
 # ========================
 # MAP USAGE TRACKER (NEW)
@@ -76,6 +80,7 @@ class MAPState:
     num_charging_events: int = 0
     spawned: bool = False          # False = unspawned (not yet deployed)
     is_following_bus: bool = False  # True = attached to a bus, moving with it
+    is_recharging: bool = False    # True = MAP is self-recharging (unavailable for bus charging)
     current_lat: Optional[float] = None
     current_lon: Optional[float] = None
 
@@ -519,7 +524,7 @@ class MAPMovementScheduler:
     """Manages MAP movement, routing, and location tracking"""
 
     def __init__(self, env: simpy.Environment, num_maps: int,
-                 map_battery_capacity_wh: float = 100000,
+                 map_battery_capacity_wh: Optional[Union[float, List[float]]] = None,
                  map_speed_ms: float = 27.78,
                  map_tracker: Optional[MAPUsageTracker] = None):
         self.env = env
@@ -527,17 +532,39 @@ class MAPMovementScheduler:
         self.map_speed_ms = map_speed_ms
         self.map_tracker = map_tracker
 
+        # Resolve per-MAP battery capacities (float → same for all; list → per-MAP)
+        if map_battery_capacity_wh is None:
+            capacities = [MAP_BATTERY_CAPACITY_WH] * num_maps
+        elif isinstance(map_battery_capacity_wh, (list, tuple)):
+            capacities = list(map_battery_capacity_wh)
+            # Pad or trim to num_maps
+            while len(capacities) < num_maps:
+                capacities.append(capacities[-1] if capacities else MAP_BATTERY_CAPACITY_WH)
+            capacities = capacities[:num_maps]
+        else:
+            capacities = [float(map_battery_capacity_wh)] * num_maps
+
         # MAP states indexed by map_id — start unspawned (current_location=None)
         self.map_states = {}
         for map_id in range(num_maps):
+            cap = capacities[map_id]
             self.map_states[map_id] = MAPState(
                 map_id=map_id,
                 current_location=None,  # unspawned
                 current_time_s=0.0,
-                current_soc_wh=map_battery_capacity_wh,
-                battery_capacity_wh=map_battery_capacity_wh,
+                current_soc_wh=cap,
+                battery_capacity_wh=cap,
                 spawned=False,
             )
+
+        # MAP SOC history for plotting: {map_id: [(time_s, soc_wh), ...]}
+        self.map_soc_history: Dict[int, List] = defaultdict(list)
+        # Record initial SOC for each MAP
+        for map_id in range(num_maps):
+            self.map_soc_history[map_id].append((0.0, self.map_states[map_id].current_soc_wh))
+
+        # SimPy process handles for self-recharging: {map_id: simpy.Process}
+        self.map_recharge_processes: Dict[int, object] = {}
 
         # Request queue for MAP assignments
         self.charging_requests = defaultdict(list)  # {map_id: [requests]}
@@ -557,6 +584,12 @@ class MAPMovementScheduler:
                     self.stop_locations[stop_id] = (float(lat), float(lon))
         except Exception as e:
             print(f"Warning: Could not set stop locations: {e}")
+
+    def record_map_soc(self, map_id: int, time_s: float):
+        """Record the current MAP SOC at the given simulation time."""
+        state = self.map_states.get(map_id)
+        if state is not None:
+            self.map_soc_history[map_id].append((time_s, state.current_soc_wh))
 
     def calculate_travel_time(self, from_location: str, to_location: str) -> Tuple[float, float]:
         """Calculate travel time and distance between two locations (in meters and seconds)
@@ -613,6 +646,10 @@ class MAPMovementScheduler:
                 movement_type="independent"
             )
 
+        # Deduct travel energy from MAP battery
+        travel_energy = distance_m * MAP_ENERGY_PER_METER_WH
+        state.current_soc_wh = max(0.0, state.current_soc_wh - travel_energy)
+
         state.current_location = target_stop_id
         if target_lat is not None:
             state.current_lat = target_lat
@@ -620,23 +657,34 @@ class MAPMovementScheduler:
             state.current_lon = target_lon
         state.distance_traveled_m += distance_m
         state.arrival_time_at_target_s = float(self.env.now) + travel_time_s
+        self.record_map_soc(map_id, float(self.env.now) + travel_time_s)
         return (travel_time_s, distance_m)
 
     def start_following(self, map_id: int, bus_id: str):
         """Mark a MAP as attached to a bus and following it"""
         state = self.map_states.get(map_id)
         if state:
+            # Cancel any running self-recharge before the MAP starts working
+            if state.is_recharging:
+                proc = self.map_recharge_processes.get(map_id)
+                if proc is not None and proc.is_alive:
+                    try:
+                        proc.interrupt()
+                    except RuntimeError:
+                        pass
+                state.is_recharging = False
             state.is_following_bus = True
             state.assigned_bus_id = bus_id
             state.is_charging = True
 
     def stop_following(self, map_id: int):
-        """Detach a MAP from its bus; MAP becomes available again"""
+        """Detach a MAP from its bus; MAP becomes available again and self-recharges if needed"""
         state = self.map_states.get(map_id)
         if state:
             state.is_following_bus = False
             state.assigned_bus_id = None
             state.is_charging = False
+            self._schedule_recharge(map_id)
 
     def update_location_following_bus(self, map_id: int, stop_id: str,
                                       lat: Optional[float] = None,
@@ -659,30 +707,70 @@ class MAPMovementScheduler:
                     associated_bus_id=state.assigned_bus_id,
                     movement_type="following_bus"
                 )
+            # Deduct travel energy from MAP battery
+            travel_energy = distance_m * MAP_ENERGY_PER_METER_WH
+            state.current_soc_wh = max(0.0, state.current_soc_wh - travel_energy)
             state.current_location = stop_id
             state.distance_traveled_m += distance_m
+            self.record_map_soc(map_id, float(self.env.now))
         if lat is not None:
             state.current_lat = lat
         if lon is not None:
             state.current_lon = lon
+
+    def _schedule_recharge(self, map_id: int):
+        """Start a self-recharge SimPy process for a MAP if its battery is not full."""
+        state = self.map_states.get(map_id)
+        if state is None or state.current_soc_wh >= state.battery_capacity_wh:
+            return
+        # Don't start a new process if one is already running
+        proc = self.map_recharge_processes.get(map_id)
+        if proc is not None and proc.is_alive:
+            return
+        # Set is_recharging synchronously so it takes effect immediately
+        state.is_recharging = True
+        self.record_map_soc(map_id, float(self.env.now))
+        process = self.env.process(self._recharge_map_process(map_id))
+        self.map_recharge_processes[map_id] = process
+
+    def _recharge_map_process(self, map_id: int):
+        """SimPy generator: self-recharge a MAP at MAP_RECHARGE_RATE_WH_S until full."""
+        state = self.map_states[map_id]
+        try:
+            while state.current_soc_wh < state.battery_capacity_wh:
+                energy_needed = state.battery_capacity_wh - state.current_soc_wh
+                time_to_full = energy_needed / MAP_RECHARGE_RATE_WH_S
+                yield self.env.timeout(time_to_full)
+                state.current_soc_wh = state.battery_capacity_wh
+        except simpy.Interrupt:
+            pass
+        finally:
+            state.is_recharging = False
+            self.map_recharge_processes.pop(map_id, None)
+            self.record_map_soc(map_id, float(self.env.now))
 
     def get_available_map(self, current_stop_id: Optional[str] = None,
                           current_lat: Optional[float] = None,
                           current_lon: Optional[float] = None) -> Optional[int]:
         """Return best available MAP: unspawned preferred, then nearest idle spawned.
 
+        A MAP is considered unavailable if it is following a bus, self-recharging,
+        or has an empty battery.
+
         Returns map_id or None if no MAP is available.
         """
-        # Prefer unspawned (spawns at target for free)
+        # Prefer unspawned (spawns at target for free), but only if it has energy
         for map_id, state in self.map_states.items():
-            if not state.spawned:
+            if not state.spawned and state.current_soc_wh > 0:
                 return map_id
 
-        # Then nearest idle spawned MAP
+        # Then nearest idle spawned MAP (not following, not recharging, has energy)
         best_map = None
         best_dist = float('inf')
         for map_id, state in self.map_states.items():
-            if state.is_following_bus or state.is_charging:
+            if state.is_following_bus or state.is_charging or state.is_recharging:
+                continue
+            if state.current_soc_wh <= 0:
                 continue
             if current_stop_id and state.current_location:
                 dist, _ = self.calculate_travel_time(state.current_location, current_stop_id)
@@ -751,11 +839,16 @@ class MAPMovementScheduler:
         """Get summary of MAP states"""
         summary = {}
         for map_id, state in self.map_states.items():
+            soc_pct = (state.current_soc_wh / state.battery_capacity_wh * 100.0
+                       if state.battery_capacity_wh > 0 else 0.0)
             summary[map_id] = {
                 'current_location': state.current_location,
                 'spawned': state.spawned,
                 'is_following_bus': state.is_following_bus,
+                'is_recharging': state.is_recharging,
                 'current_soc_wh': state.current_soc_wh,
+                'battery_capacity_wh': state.battery_capacity_wh,
+                'current_soc_pct': soc_pct,
                 'distance_traveled_m': state.distance_traveled_m,
                 'num_charging_events': state.num_charging_events,
                 'assigned_bus': state.assigned_bus_id
@@ -796,7 +889,8 @@ class Stage2DESTerminalChargingPreemptive:
                  initial_battery_capacity_wh: float = 250000,
                  num_maps: int = 1,
                  optimize_threshold: bool = True,
-                 preemption_threshold: Optional[float] = None):
+                 preemption_threshold: Optional[float] = None,
+                 map_battery_capacity_wh: Optional[Union[float, List[float]]] = None):
 
         self.sim = sim
         self.bus_trips_dict = bus_trips_dict
@@ -837,7 +931,7 @@ class Stage2DESTerminalChargingPreemptive:
         self.map_movement_scheduler = MAPMovementScheduler(
             self.env,
             num_maps=num_maps,
-            map_battery_capacity_wh=initial_battery_capacity_wh,
+            map_battery_capacity_wh=map_battery_capacity_wh,
             map_speed_ms=CHARGER_SPEED_MS,
             map_tracker=self.map_tracker
         )
@@ -883,9 +977,12 @@ class Stage2DESTerminalChargingPreemptive:
         following_map = self.map_movement_scheduler.get_following_map_for_bus(bus_id)
         if following_map is not None:
             if soc < target_wh:
+                map_state = self.map_movement_scheduler.map_states[following_map]
+                available_map_energy = map_state.current_soc_wh
                 t_start = float(self.env.now)
                 energy = min(MAP_CHARGING_RATE_WH_S * layover_duration_s,
-                             target_wh - soc)
+                             target_wh - soc,
+                             available_map_energy)
                 charge_dur = energy / MAP_CHARGING_RATE_WH_S if MAP_CHARGING_RATE_WH_S > 0 else 0.0
                 if charge_dur > 0:
                     yield self.env.timeout(charge_dur)
@@ -893,6 +990,9 @@ class Stage2DESTerminalChargingPreemptive:
                     new_soc = min(capacity, soc_before + energy)
                     self.bus_soc[bus_id] = new_soc
                     self.bus_energy_charged[bus_id] += energy
+                    # Deduct energy from MAP battery
+                    map_state.current_soc_wh = max(0.0, map_state.current_soc_wh - energy)
+                    self.map_movement_scheduler.record_map_soc(following_map, float(self.env.now))
                     self.map_tracker.record_charge(
                         map_id=following_map, bus_id=bus_id,
                         start_time=t_start, end_time=float(self.env.now),
@@ -900,7 +1000,7 @@ class Stage2DESTerminalChargingPreemptive:
                         soc_before=soc_before, soc_after=new_soc,
                         charging_type="terminal"
                     )
-                    if new_soc >= target_wh:
+                    if new_soc >= target_wh or map_state.current_soc_wh <= 0:
                         self.map_movement_scheduler.stop_following(following_map)
             return
 
@@ -922,9 +1022,13 @@ class Stage2DESTerminalChargingPreemptive:
             yield self.env.timeout(travel_time_s)
 
         self.map_movement_scheduler.start_following(map_id, bus_id)
+        map_state = self.map_movement_scheduler.map_states[map_id]
         soc = self.bus_soc.get(bus_id, capacity)
         t_start = float(self.env.now)
-        energy = min(MAP_CHARGING_RATE_WH_S * remaining, max(0.0, target_wh - soc))
+        available_map_energy = map_state.current_soc_wh
+        energy = min(MAP_CHARGING_RATE_WH_S * remaining,
+                     max(0.0, target_wh - soc),
+                     available_map_energy)
         charge_dur = energy / MAP_CHARGING_RATE_WH_S if (MAP_CHARGING_RATE_WH_S > 0 and energy > 0) else 0.0
         if charge_dur > 0:
             yield self.env.timeout(charge_dur)
@@ -932,6 +1036,9 @@ class Stage2DESTerminalChargingPreemptive:
             new_soc = min(capacity, soc_before + energy)
             self.bus_soc[bus_id] = new_soc
             self.bus_energy_charged[bus_id] += energy
+            # Deduct energy from MAP battery
+            map_state.current_soc_wh = max(0.0, map_state.current_soc_wh - energy)
+            self.map_movement_scheduler.record_map_soc(map_id, float(self.env.now))
             self.map_tracker.record_charge(
                 map_id=map_id, bus_id=bus_id,
                 start_time=t_start, end_time=float(self.env.now),
@@ -939,7 +1046,7 @@ class Stage2DESTerminalChargingPreemptive:
                 soc_before=soc_before, soc_after=new_soc,
                 charging_type="terminal"
             )
-            if new_soc >= target_wh:
+            if new_soc >= target_wh or map_state.current_soc_wh <= 0:
                 self.map_movement_scheduler.stop_following(map_id)
 
     def run_simulation(self, duration_s: float = 86400) -> Dict:
@@ -1097,10 +1204,13 @@ class Stage2DESTerminalChargingPreemptive:
                     was_following_map = following_map  # remember for location update
                     soc = self.bus_soc[bus_id]
                     target_wh = BUS_CHARGE_CUTOFF_SOC * capacity
-                    if soc < target_wh and dt > 0:
+                    map_state = self.map_movement_scheduler.map_states[following_map]
+                    available_map_energy = map_state.current_soc_wh
+                    if soc < target_wh and dt > 0 and available_map_energy > 0:
                         seg_energy = min(
                             MAP_CHARGING_RATE_WH_S * max(0.0, dt),
-                            target_wh - soc
+                            target_wh - soc,
+                            available_map_energy
                         )
                         if seg_energy > 0:
                             t_start = float(self.env.now) - max(0.0, dt)
@@ -1108,6 +1218,9 @@ class Stage2DESTerminalChargingPreemptive:
                             new_charged_soc = min(capacity, soc + seg_energy)
                             self.bus_soc[bus_id] = new_charged_soc
                             self.bus_energy_charged[bus_id] += seg_energy
+                            # Deduct delivered energy from MAP battery
+                            map_state.current_soc_wh = max(0.0, map_state.current_soc_wh - seg_energy)
+                            self.map_movement_scheduler.record_map_soc(following_map, float(self.env.now))
                             self.map_tracker.record_charge(
                                 map_id=following_map, bus_id=bus_id,
                                 start_time=t_start, end_time=float(self.env.now),
@@ -1116,7 +1229,7 @@ class Stage2DESTerminalChargingPreemptive:
                                 soc_before=soc_before, soc_after=new_charged_soc,
                                 charging_type="en_route_segment"
                             )
-                            if new_charged_soc >= target_wh:
+                            if new_charged_soc >= target_wh or map_state.current_soc_wh <= 0:
                                 self.map_movement_scheduler.stop_following(following_map)
                                 following_map = None
 
@@ -1247,20 +1360,25 @@ class Stage2DESTerminalChargingPreemptive:
         """Print MAP movement statistics"""
         summary = self.map_movement_scheduler.get_summary()
 
+        # Column widths: 8+10+12+15+20+12+15+15 = 107 chars + 7 spaces = 114
+        _SEP_WIDTH = 114
+
         print("\n" + "="*70)
         print("MAP MOVEMENT STATISTICS")
         print("="*70)
-        print(f"\n{'MAP ID':<8} {'Spawned':<10} {'Following Bus':<15} {'Current Location':<20} "
-              f"{'Current SOC (Wh)':<20} {'Distance (km)':<15} {'Charging Events':<15}")
-        print("-"*120)
+        print(f"\n{'MAP ID':<8} {'Spawned':<10} {'Recharging':<12} {'Following Bus':<15} "
+              f"{'Current Location':<20} {'SOC':<12} {'Distance (km)':<15} {'Charging Events':<15}")
+        print("-"*_SEP_WIDTH)
 
         for map_id, state_summary in summary.items():
             distance_km = state_summary['distance_traveled_m'] / 1000
             loc = state_summary['current_location'] or "unspawned"
             spawned_str = "Yes" if state_summary.get('spawned') else "No"
+            recharging_str = "Yes" if state_summary.get('is_recharging') else "No"
             following_str = str(state_summary.get('assigned_bus') or "-")
-            print(f"{map_id:<8} {spawned_str:<10} {following_str:<15} {loc:<20} "
-                  f"{state_summary['current_soc_wh']:<20.0f} {distance_km:<15.1f} "
+            soc_str = f"{state_summary['current_soc_pct']:.1f}%"
+            print(f"{map_id:<8} {spawned_str:<10} {recharging_str:<12} {following_str:<15} "
+                  f"{loc:<20} {soc_str:<12} {distance_km:<15.1f} "
                   f"{state_summary['num_charging_events']:<15}")
 
         print(f"\n{'='*70}\n")
@@ -1456,6 +1574,44 @@ class Stage2DESTerminalChargingPreemptive:
         print(f"Plot saved to: {save_path}")
         plt.show()
 
+    def plot_map_soc(self, save_path: str = "map_soc_trajectories.png"):
+        """Plot MAP battery SOC (%) versus simulation time for each MAP."""
+
+        has_data = any(
+            len(self.map_movement_scheduler.map_soc_history.get(mid, [])) > 1
+            for mid in range(self.num_maps)
+        )
+        if not has_data:
+            print("No MAP SOC history to plot")
+            return
+
+        plt.figure(figsize=(14, 7))
+        colors = plt.cm.tab10(np.linspace(0, 1, max(self.num_maps, 1)))
+
+        for map_id in range(self.num_maps):
+            history = self.map_movement_scheduler.map_soc_history.get(map_id, [])
+            if len(history) < 2:
+                continue
+            cap_wh = self.map_movement_scheduler.map_states[map_id].battery_capacity_wh
+            times = [h[0] / 3600 for h in history]
+            soc_pct = [h[1] / cap_wh * 100.0 for h in history]
+            plt.plot(times, soc_pct, linewidth=2, label=f'MAP {map_id} (cap {cap_wh/1000:.0f} kWh)',
+                     color=colors[map_id])
+
+        plt.axhline(y=100.0, color='green', linestyle='--', linewidth=1.5, alpha=0.6, label='100 %')
+        plt.axhline(y=0.0, color='red', linestyle='--', linewidth=1.5, alpha=0.6, label='0 %')
+        plt.ylim(-5, 110)
+        plt.xlabel('Time (hours)', fontweight='bold', fontsize=12)
+        plt.ylabel('MAP Battery SOC (%)', fontweight='bold', fontsize=12)
+        plt.title('MAP Battery State of Charge vs Time', fontweight='bold', fontsize=13)
+        plt.legend(loc='best', fontsize=10)
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Plot saved to: {save_path}")
+        plt.show()
+
 # ========================
 # SIMULATION RUNNER
 # ========================
@@ -1465,7 +1621,8 @@ def run_terminal_charging_simulation(sim, bus_trips_dict, bus_lines, trip_change
                                     num_maps: int = 1,
                                     optimize_threshold: bool = True,
                                     preemption_threshold: Optional[float] = None,
-                                    simulation_duration_s: float = 86400):
+                                    simulation_duration_s: float = 86400,
+                                    map_battery_capacity_wh: Optional[Union[float, List[float]]] = None):
     """Execute terminal charging simulation with MAP tracking"""
 
     stage2 = Stage2DESTerminalChargingPreemptive(
@@ -1476,7 +1633,8 @@ def run_terminal_charging_simulation(sim, bus_trips_dict, bus_lines, trip_change
         initial_battery_capacity_wh=battery_capacity_wh,
         num_maps=num_maps,
         optimize_threshold=optimize_threshold,
-        preemption_threshold=preemption_threshold
+        preemption_threshold=preemption_threshold,
+        map_battery_capacity_wh=map_battery_capacity_wh
     )
 
     results = stage2.run_simulation(simulation_duration_s)
@@ -1537,5 +1695,6 @@ def run_terminal_charging_simulation(sim, bus_trips_dict, bus_lines, trip_change
     stage2.plot_map_energy_delivery(save_path="map_energy_delivery.png")
     stage2.plot_cumulative_energy_delivery(save_path="cumulative_energy_delivery.png")
     stage2.plot_map_movement(save_path="map_movement_distance.png")  # NEW: Plot MAP movement
+    stage2.plot_map_soc(save_path="map_soc_trajectories.png")       # NEW: Plot MAP SOC vs time
 
     return results, stage2
