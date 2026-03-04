@@ -788,28 +788,6 @@ class MAPMovementScheduler:
                 return map_id
         return None
 
-    def assign_map_to_bus(self, map_id: int, bus_id: str, current_location: str,
-                         target_location: str) -> Optional[Tuple[float, float]]:
-        """Assign a MAP to move to a bus location (legacy helper kept for compatibility)
-
-        Returns: (travel_time_s, distance_m) or None if invalid
-        """
-        if map_id < 0 or map_id >= self.num_maps:
-            return None
-
-        map_state = self.map_states.get(map_id)
-        if map_state is None:
-            return None
-
-        distance_m, travel_time_s = self.calculate_travel_time(
-            map_state.current_location or "", target_location)
-
-        map_state.current_location = target_location
-        map_state.assigned_bus_id = bus_id
-        map_state.arrival_time_at_target_s = float(self.env.now) + travel_time_s
-        map_state.distance_traveled_m += distance_m
-        return (travel_time_s, distance_m)
-
     def get_map_location(self, map_id: int) -> Optional[str]:
         """Get current location of a MAP"""
         if map_id in self.map_states:
@@ -821,13 +799,6 @@ class MAPMovementScheduler:
         if map_id in self.map_states:
             return self.map_states[map_id].current_soc_wh
         return 0.0
-
-    def update_map_soc(self, map_id: int, energy_consumed_wh: float):
-        """Update MAP SOC after charging a bus"""
-        if map_id in self.map_states:
-            state = self.map_states[map_id]
-            state.current_soc_wh = max(0.0, state.current_soc_wh - energy_consumed_wh)
-            state.num_charging_events += 1
 
     def map_is_at_location(self, map_id: int, location: str) -> bool:
         """Check if a MAP is at a specific location"""
@@ -976,32 +947,35 @@ class Stage2DESTerminalChargingPreemptive:
         # --- Case 1: a MAP is already following this bus ---
         following_map = self.map_movement_scheduler.get_following_map_for_bus(bus_id)
         if following_map is not None:
-            if soc < target_wh:
-                map_state = self.map_movement_scheduler.map_states[following_map]
-                available_map_energy = map_state.current_soc_wh
-                t_start = float(self.env.now)
-                energy = min(MAP_CHARGING_RATE_WH_S * layover_duration_s,
-                             target_wh - soc,
-                             available_map_energy)
-                charge_dur = energy / MAP_CHARGING_RATE_WH_S if MAP_CHARGING_RATE_WH_S > 0 else 0.0
-                if charge_dur > 0:
-                    yield self.env.timeout(charge_dur)
-                    soc_before = self.bus_soc.get(bus_id, capacity)
-                    new_soc = min(capacity, soc_before + energy)
-                    self.bus_soc[bus_id] = new_soc
-                    self.bus_energy_charged[bus_id] += energy
-                    # Deduct energy from MAP battery
-                    map_state.current_soc_wh = max(0.0, map_state.current_soc_wh - energy)
-                    self.map_movement_scheduler.record_map_soc(following_map, float(self.env.now))
-                    self.map_tracker.record_charge(
-                        map_id=following_map, bus_id=bus_id,
-                        start_time=t_start, end_time=float(self.env.now),
-                        energy_wh=energy, location=f"stop_{stop_id}",
-                        soc_before=soc_before, soc_after=new_soc,
-                        charging_type="terminal"
-                    )
-                    if new_soc >= target_wh or map_state.current_soc_wh <= 0:
-                        self.map_movement_scheduler.stop_following(following_map)
+            map_state = self.map_movement_scheduler.map_states[following_map]
+            # Release MAP if bus is already charged or MAP has no energy to give
+            if soc >= target_wh or map_state.current_soc_wh <= 0:
+                self.map_movement_scheduler.stop_following(following_map)
+                return
+            available_map_energy = map_state.current_soc_wh
+            t_start = float(self.env.now)
+            energy = min(MAP_CHARGING_RATE_WH_S * layover_duration_s,
+                         target_wh - soc,
+                         available_map_energy)
+            charge_dur = energy / MAP_CHARGING_RATE_WH_S if MAP_CHARGING_RATE_WH_S > 0 else 0.0
+            if charge_dur > 0:
+                yield self.env.timeout(charge_dur)
+                soc_before = self.bus_soc.get(bus_id, capacity)
+                new_soc = min(capacity, soc_before + energy)
+                self.bus_soc[bus_id] = new_soc
+                self.bus_energy_charged[bus_id] += energy
+                # Deduct energy from MAP battery
+                map_state.current_soc_wh = max(0.0, map_state.current_soc_wh - energy)
+                self.map_movement_scheduler.record_map_soc(following_map, float(self.env.now))
+                self.map_tracker.record_charge(
+                    map_id=following_map, bus_id=bus_id,
+                    start_time=t_start, end_time=float(self.env.now),
+                    energy_wh=energy, location=f"stop_{stop_id}",
+                    soc_before=soc_before, soc_after=new_soc,
+                    charging_type="terminal"
+                )
+                if new_soc >= target_wh or map_state.current_soc_wh <= 0:
+                    self.map_movement_scheduler.stop_following(following_map)
             return
 
         # --- Case 2: no MAP following; request one if bus needs charge ---
@@ -1014,6 +988,12 @@ class Stage2DESTerminalChargingPreemptive:
 
         travel_time_s, _ = self.map_movement_scheduler.spawn_or_travel_to(map_id, stop_id)
 
+        # Check MAP still has energy after travel (long independent journey may drain it)
+        map_state = self.map_movement_scheduler.map_states[map_id]
+        if map_state.current_soc_wh <= 0:
+            self.map_movement_scheduler._schedule_recharge(map_id)
+            return
+
         remaining = layover_duration_s - travel_time_s
         if remaining <= 0:
             return
@@ -1022,7 +1002,6 @@ class Stage2DESTerminalChargingPreemptive:
             yield self.env.timeout(travel_time_s)
 
         self.map_movement_scheduler.start_following(map_id, bus_id)
-        map_state = self.map_movement_scheduler.map_states[map_id]
         soc = self.bus_soc.get(bus_id, capacity)
         t_start = float(self.env.now)
         available_map_energy = map_state.current_soc_wh
@@ -1181,6 +1160,17 @@ class Stage2DESTerminalChargingPreemptive:
                 except Exception:
                     dist = 0.0
 
+                # Pre-segment check: release MAP before travel if bus is already fully
+                # charged OR the MAP has no energy left. This prevents the MAP from
+                # riding along for a segment where it can deliver nothing.
+                pre_following = self.map_movement_scheduler.get_following_map_for_bus(bus_id)
+                if pre_following is not None:
+                    pre_map_state = self.map_movement_scheduler.map_states[pre_following]
+                    pre_soc = self.bus_soc.get(bus_id, capacity)
+                    if (pre_soc >= BUS_CHARGE_CUTOFF_SOC * capacity
+                            or pre_map_state.current_soc_wh <= 0):
+                        self.map_movement_scheduler.stop_following(pre_following)
+
                 yield self.env.timeout(max(0.0, dt))
                 current_time = curr_stop["arrival"]
 
@@ -1233,9 +1223,14 @@ class Stage2DESTerminalChargingPreemptive:
                                 self.map_movement_scheduler.stop_following(following_map)
                                 following_map = None
 
-                    # Always update MAP location to current stop (even if just detached)
+                    # Update MAP location to current stop (MAP traveled with bus this segment)
                     self.map_movement_scheduler.update_location_following_bus(
                         was_following_map, curr_stop_id, curr_lat, curr_lon)
+
+                    # Release MAP if travel energy has now drained its battery
+                    if (following_map is not None
+                            and self.map_movement_scheduler.map_states[following_map].current_soc_wh <= 0):
+                        self.map_movement_scheduler.stop_following(following_map)
 
                 # 3. If no MAP following and SOC is below threshold, request one
                 if (self.map_movement_scheduler.get_following_map_for_bus(bus_id) is None
@@ -1244,10 +1239,15 @@ class Stage2DESTerminalChargingPreemptive:
                     available_map = self.map_movement_scheduler.get_available_map(
                         curr_stop_id, curr_lat, curr_lon)
                     if available_map is not None:
-                        # Spawn at bus location (0 time) or travel (recorded but non-blocking)
+                        # Spawn at bus location (0 time) or travel to bus (non-blocking,
+                        # energy deducted for travel distance)
                         self.map_movement_scheduler.spawn_or_travel_to(
                             available_map, curr_stop_id, curr_lat, curr_lon)
-                        self.map_movement_scheduler.start_following(available_map, bus_id)
+                        # Only start following if MAP still has energy after travel
+                        if self.map_movement_scheduler.map_states[available_map].current_soc_wh > 0:
+                            self.map_movement_scheduler.start_following(available_map, bus_id)
+                        else:
+                            self.map_movement_scheduler._schedule_recharge(available_map)
 
                 self.bus_soc_history[bus_id].append(
                     (self.env.now, self.bus_soc.get(bus_id, capacity)))
