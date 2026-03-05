@@ -2288,10 +2288,14 @@ class BaselineTerminalChargingSimulation:
     -----
     * One MAP is placed permanently at each trip-change stop (terminal).
     * MAPs never follow buses — they act as fixed chargers at their terminal.
-    * When multiple buses arrive at the same terminal simultaneously (or the
-      charger is busy), the bus with the **lowest SOC** is served first
-      (preemption by priority).  A bus currently charging is preempted if a
-      newly arriving bus has a lower SOC.
+    * A bus requests the terminal charger whenever its SOC drops below
+      ``BUS_CHARGE_THRESHOLD_SOC`` (70 %).  Waiting buses are ordered by SOC
+      so the most depleted bus is served first.
+    * **Preemption**: a bus currently being charged is *interrupted* only if a
+      newly arriving bus's SOC is below the *preemption threshold* (derived from
+      :class:`PreemptionStrategyAnalyzer`).  Buses whose SOC falls between the
+      preemption threshold and 70 % join the queue but do not interrupt an
+      ongoing session.
     * MAPs recharge themselves at their terminal depot whenever they are not
       serving a bus.  The self-recharge rate is ``MAP_RECHARGE_RATE_WH_S``.
     * The MAP 10 % SOC floor is respected: a MAP only charges a bus with the
@@ -2312,12 +2316,22 @@ class BaselineTerminalChargingSimulation:
         Parameters
         ----------
         preemption_threshold : float or None
-            SOC fraction (0–1) below which a bus will request the charger and
-            participate in preemptive scheduling.  When *None* (the default)
-            the threshold is derived automatically by running
-            :class:`PreemptionStrategyAnalyzer` on the provided bus trips,
-            which accounts for actual energy consumption patterns.
-            Pass an explicit value to override the automatic recommendation.
+            SOC fraction (0–1) used to decide whether a newly-arriving bus may
+            *interrupt* a bus that is already being charged.  When the arriving
+            bus's SOC is strictly below this value it is considered critical and
+            will preempt the ongoing charging session.  Buses whose SOC is at
+            or above this value will join the queue but will not interrupt an
+            ongoing charge.
+
+            All buses still *request* charging whenever their SOC is below
+            ``BUS_CHARGE_THRESHOLD_SOC`` (70 %); the preemption threshold only
+            controls *interruption* priority, not whether a bus requests
+            charging at all.
+
+            When *None* (the default) the threshold is derived automatically by
+            :class:`PreemptionStrategyAnalyzer`, which analyses the actual
+            per-trip energy consumption to pick a value in the [0.25, 0.60]
+            range.  Pass an explicit value to override that recommendation.
         """
         self.sim = sim
         self.bus_trips_dict = bus_trips_dict
@@ -2549,15 +2563,22 @@ class BaselineTerminalChargingSimulation:
                                    layover_duration_s: float, capacity: float):
         """Generator: compete for the terminal charger with SOC-based preemption.
 
-        The bus requests the terminal PriorityResource using ``-soc_wh`` as the
-        priority (lower value = higher priority = served first).  If the
-        resource is held by a bus with higher SOC, it is preempted.
+        Every bus whose SOC is below ``BUS_CHARGE_THRESHOLD_SOC`` (70 %) will
+        request the terminal charger.  The SimPy PriorityResource orders
+        waiting buses by SOC (lowest SOC served first).
+
+        *Preemption* — interrupting a bus that is currently being charged — is
+        only triggered when the requesting bus's SOC is strictly below
+        ``self.preemption_threshold`` (derived from
+        :class:`PreemptionStrategyAnalyzer`).  This means only critically-low
+        buses interrupt an ongoing session; buses that are merely below 70 %
+        SOC join the queue without disrupting a running charge.
         """
         soc = self.bus_soc.get(bus_id, capacity)
         target_wh = BUS_CHARGE_CUTOFF_SOC * capacity
 
-        if soc >= self.preemption_threshold * capacity:
-            return  # Bus SOC is above threshold — no charging needed
+        if soc >= BUS_CHARGE_THRESHOLD_SOC * capacity:
+            return  # Bus SOC is at or above 70 % — charging not needed
 
         charger = self._chargers.get(stop_id)
         if charger is None:
@@ -2565,7 +2586,10 @@ class BaselineTerminalChargingSimulation:
 
         # Priority: lower numeric value = served first → use negative SOC
         priority = -soc
-        req = charger.request(priority=priority, preempt=True)
+        # Only preempt (interrupt) the currently-charging bus if this bus
+        # is critically low (below the preemption threshold).
+        can_preempt = soc < self.preemption_threshold * capacity
+        req = charger.request(priority=priority, preempt=can_preempt)
         t_request = float(self.env.now)
 
         # Try to acquire the charger within the layover window
@@ -2646,7 +2670,10 @@ class BaselineTerminalChargingSimulation:
         print(f"MAP battery capacity:  {self.map_battery_capacity_wh/1000:,.1f} kWh")
         print(f"MAP charging rate:     {self.map_charging_rate_wh_s:.2f} Wh/s")
         print(f"MAP self-recharge:     {self.map_recharge_rate_wh_s:.2f} Wh/s")
-        print(f"Preemption threshold:  {self.preemption_threshold*100:.1f}% SOC")
+        print(f"Charging threshold:    {BUS_CHARGE_THRESHOLD_SOC*100:.0f}% SOC "
+              f"(buses request charging below this)")
+        print(f"Preemption threshold:  {self.preemption_threshold*100:.1f}% SOC "
+              f"(buses below this may interrupt an ongoing charge)")
         print(f"Terminal stops:        {len(self.trip_change_stops)}")
         print(f"  (one stationary MAP per terminal)")
         print(f"Simulation duration:   {duration_s/3600:,.1f} hours\n")
@@ -2724,9 +2751,12 @@ class BaselineTerminalChargingSimulation:
         print(f"\nFEASIBILITY CHECK:")
         print(f"  Bus battery capacity:  {results['battery_capacity_wh']/1000:,.1f} kWh")
         print(f"  Terminals (= MAPs):    {results['num_terminals']}")
+        print(f"  Charging threshold:    {BUS_CHARGE_THRESHOLD_SOC*100:.0f}% SOC "
+              f"(all buses below this request charging)")
         thr = results.get('preemption_threshold')
         if thr is not None:
-            print(f"  Preemption threshold:  {thr*100:.1f}% SOC")
+            print(f"  Preemption threshold:  {thr*100:.1f}% SOC "
+                  f"(buses below this interrupt ongoing charges)")
         print(f"  Preemptions occurred:  {results['preemption_count']}")
         print(f"  Minimum bus SOC seen:  {results['min_soc_overall_ratio']*100:.1f}%")
         if results['feasible']:
@@ -2784,9 +2814,12 @@ class BaselineTerminalChargingSimulation:
             plt.plot(t, s, color=lines_seen[line_key], linewidth=1, alpha=0.5)
 
         plt.axhline(y=BUS_CHARGE_CUTOFF_SOC * 100, color="green", linestyle="--",
-                    linewidth=2, alpha=0.5, label=f"{BUS_CHARGE_CUTOFF_SOC*100:.0f}% target")
+                    linewidth=2, alpha=0.5, label=f"{BUS_CHARGE_CUTOFF_SOC*100:.0f}% charge-to target")
         plt.axhline(y=BUS_CHARGE_THRESHOLD_SOC * 100, color="orange", linestyle="--",
-                    linewidth=2, alpha=0.5, label=f"{BUS_CHARGE_THRESHOLD_SOC*100:.0f}% threshold")
+                    linewidth=2, alpha=0.5, label=f"{BUS_CHARGE_THRESHOLD_SOC*100:.0f}% charging threshold (request)")
+        plt.axhline(y=self.preemption_threshold * 100, color="purple", linestyle="-.",
+                    linewidth=2, alpha=0.7,
+                    label=f"{self.preemption_threshold*100:.1f}% preemption threshold (interrupt)")
         plt.axhline(y=BUS_MIN_SOC * 100, color="red", linestyle="--",
                     linewidth=2, alpha=0.5, label=f"{BUS_MIN_SOC*100:.0f}% minimum")
 
@@ -3020,9 +3053,14 @@ def run_baseline_simulation(sim, bus_trips_dict, trip_change_stops,
     map_battery_capacity_wh  : MAP battery capacity (Wh)
     map_charging_rate_wh_s   : MAP-to-bus charging rate (Wh/s)
     map_recharge_rate_wh_s   : MAP self-recharge rate (Wh/s)
-    preemption_threshold     : SOC fraction (0–1) below which a bus will
-                               request the charger.  Pass *None* (default) to
-                               let :class:`PreemptionStrategyAnalyzer` choose
+    preemption_threshold     : SOC fraction (0–1) below which a newly-arriving
+                               bus may *interrupt* (preempt) an ongoing
+                               charging session at the terminal.  Buses whose
+                               SOC is in the range (preemption_threshold, 70%)
+                               will still request charging but will join the
+                               queue without interrupting the current session.
+                               Pass *None* (default) to let
+                               :class:`PreemptionStrategyAnalyzer` choose
                                the value automatically.
     simulation_duration_s    : length of simulation (seconds)
 
