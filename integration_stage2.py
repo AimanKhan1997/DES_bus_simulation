@@ -1199,6 +1199,100 @@ class ChargingStrategyOptimizer:
 
         print(f"\n{'=' * 70}\n")
 
+    def compare_with_baseline(self, baseline_results: Dict) -> Dict:
+        """Compare offline optimal plans against a baseline simulation run.
+
+        Parameters
+        ----------
+        baseline_results : dict returned by
+            :meth:`BaselineTerminalChargingSimulation._collect_statistics`
+
+        Returns a comparison dict and prints a human-readable report.
+        """
+        bus_stats = baseline_results.get("bus_statistics", {})
+
+        baseline_feasible = baseline_results.get("feasible", False)
+        baseline_min_soc = baseline_results.get("min_soc_overall_ratio", 0.0)
+        baseline_total_charged = baseline_results.get("total_energy_charged_wh", 0.0)
+        buses_below_floor = set(baseline_results.get("buses_below_floor", []))
+
+        # Offline optimal — use the plans already computed by _analyze()
+        opt_methods = self.system_summary.get("method_distribution", {})
+        opt_total_energy = self.system_summary.get("total_energy_needed_wh", 0.0)
+        buses_needing_enroute = [
+            b for b, p in self.bus_charging_plans.items()
+            if p.get("method") in {"en_route", "hybrid"}
+        ]
+
+        # Improvement flag: dynamic strategy is "better" if baseline is
+        # infeasible OR if it would reduce total MAP travel (en-route means
+        # MAP follows bus, so MAP distance is equal to bus distance for those
+        # segments — the optimizer already accounts for this via method choice)
+        improvement_possible = (
+            not baseline_feasible or len(buses_needing_enroute) > 0
+        )
+
+        comparison = {
+            "baseline_feasible": baseline_feasible,
+            "baseline_min_soc_pct": baseline_min_soc * 100.0,
+            "baseline_total_charged_wh": baseline_total_charged,
+            "baseline_buses_below_floor": list(buses_below_floor),
+            "opt_method_distribution": opt_methods,
+            "opt_total_energy_needed_wh": opt_total_energy,
+            "buses_needing_enroute_charging": buses_needing_enroute,
+            "dynamic_strategy_improves": improvement_possible,
+        }
+
+        # Print report
+        print("\n" + "=" * 70)
+        print("POST-SIMULATION STRATEGY COMPARISON")
+        print("  Baseline (stationary MAPs) vs Offline Optimal")
+        print("=" * 70)
+
+        print(f"\nBASELINE RESULTS:")
+        print(f"  Feasible:              {'✓ YES' if baseline_feasible else '✗ NO'}")
+        print(f"  Min bus SOC:           {baseline_min_soc*100:.1f}%")
+        print(f"  Total energy charged:  {baseline_total_charged/1e6:,.3f} MWh")
+        if buses_below_floor:
+            print(f"  Buses below 20% floor: {len(buses_below_floor)}")
+
+        print(f"\nOFFLINE OPTIMAL (ChargingStrategyOptimizer):")
+        print(f"  Total energy demand:   {opt_total_energy/1e6:,.3f} MWh")
+        print(f"  Method breakdown:")
+        for method, count in sorted(opt_methods.items()):
+            pct = 100.0 * count / max(1, self.system_summary["total_buses"])
+            print(f"    {method:<12}: {count:>4} buses  ({pct:.0f}%)")
+
+        if buses_needing_enroute:
+            print(f"\n  Buses that CANNOT be served by terminal-only charging:")
+            for b in buses_needing_enroute[:10]:
+                p = self.bus_charging_plans[b]
+                bl_min = bus_stats.get(b, {}).get("min_soc_ratio", 1.0)
+                print(f"    {b:<22} baseline_min={bl_min*100:.1f}%  "
+                      f"method={p['method']}  "
+                      f"need={p.get('total_energy_needed_wh', 0)/1000:.1f} kWh")
+            if len(buses_needing_enroute) > 10:
+                print(f"    … and {len(buses_needing_enroute) - 10} more")
+
+        print(f"\nRECOMMENDATION:")
+        if not improvement_possible:
+            print(f"  ✓ Baseline strategy is SUFFICIENT.")
+            print(f"    All buses stay above {BUS_MIN_SOC*100:.0f}% SOC with terminal-only charging.")
+            print(f"    No en-route or hybrid charging is needed.")
+        else:
+            if not baseline_feasible:
+                print(f"  ✗ Baseline is INFEASIBLE — some buses fell below "
+                      f"{BUS_MIN_SOC*100:.0f}% SOC.")
+            if buses_needing_enroute:
+                print(f"  ⚡ Dynamic strategy (en-route / hybrid) is RECOMMENDED.")
+                print(f"    {len(buses_needing_enroute)} bus(es) require charging "
+                      f"beyond what terminals alone can supply.")
+                print(f"    Use run_terminal_charging_simulation() with the same "
+                      f"num_maps to enable en-route charging.")
+
+        print("=" * 70 + "\n")
+        return comparison
+
 
 # ========================
 # DEPOT PLACEMENT OPTIMIZER
@@ -2183,6 +2277,531 @@ class Stage2DESTerminalChargingPreemptive:
         plt.show()
 
 # ========================
+# BASELINE SIMULATION
+# ========================
+
+class BaselineTerminalChargingSimulation:
+    """Baseline DES scenario: one stationary MAP per terminal, charging buses
+    during layover times only.
+
+    Rules
+    -----
+    * One MAP is placed permanently at each trip-change stop (terminal).
+    * MAPs never follow buses — they act as fixed chargers at their terminal.
+    * When multiple buses arrive at the same terminal simultaneously (or the
+      charger is busy), the bus with the **lowest SOC** is served first
+      (preemption by priority).  A bus currently charging is preempted if a
+      newly arriving bus has a lower SOC.
+    * MAPs recharge themselves at their terminal depot whenever they are not
+      serving a bus.  The self-recharge rate is ``MAP_RECHARGE_RATE_WH_S``.
+    * The MAP 10 % SOC floor is respected: a MAP only charges a bus with the
+      energy above ``MAP_MIN_SOC × capacity``.
+    * Buses may still fall below 20 % SOC if the terminal layover time or the
+      MAP's available energy is insufficient — this is captured in the results
+      so a post-simulation comparison can flag where the baseline fails.
+    """
+
+    def __init__(self, sim, bus_trips_dict: Dict[str, List[str]],
+                 trip_change_stops: set,
+                 initial_battery_capacity_wh: float = 250000,
+                 map_battery_capacity_wh: float = MAP_BATTERY_CAPACITY_WH,
+                 map_charging_rate_wh_s: float = MAP_CHARGING_RATE_WH_S,
+                 map_recharge_rate_wh_s: float = MAP_RECHARGE_RATE_WH_S):
+
+        self.sim = sim
+        self.bus_trips_dict = bus_trips_dict
+        self.trip_change_stops = trip_change_stops
+        self.battery_capacity_wh = initial_battery_capacity_wh
+        self.map_battery_capacity_wh = map_battery_capacity_wh
+        self.map_charging_rate_wh_s = map_charging_rate_wh_s
+        self.map_recharge_rate_wh_s = map_recharge_rate_wh_s
+
+        self.env = simpy.Environment()
+
+        # One MAP per terminal stop.  Each MAP has its own SimPy Resource
+        # (capacity = 1) and SOC state.  Priority is inverted: lower numeric
+        # priority value = served first, so we use ``-soc_wh`` as priority.
+        self._map_soc: Dict[str, float] = {
+            s: map_battery_capacity_wh for s in trip_change_stops
+        }
+        self._map_soc_history: Dict[str, List] = {
+            s: [(0.0, map_battery_capacity_wh)] for s in trip_change_stops
+        }
+        # SimPy PriorityResource: lower priority value → served first.
+        self._chargers: Dict[str, simpy.PriorityResource] = {
+            s: simpy.PriorityResource(self.env, capacity=1)
+            for s in trip_change_stops
+        }
+        # Track ongoing self-recharge processes so they can be interrupted.
+        self._recharge_procs: Dict[str, object] = {}
+
+        self.bus_soc: Dict[str, float] = {}
+        self.bus_energy_charged: Dict[str, float] = defaultdict(float)
+        self.bus_soc_history: Dict[str, List] = defaultdict(list)
+
+        self.layovers: List[LayoverRecord] = []
+
+        # Preemption tracking
+        self._preemption_count: int = 0
+
+        # Per-bus minimum SOC tracking
+        self._bus_min_soc: Dict[str, float] = {}
+        self._bus_total_energy_consumed: Dict[str, float] = defaultdict(float)
+
+        # Charging event log for the tracker
+        self.charging_events: List[Dict] = []
+
+    # ------------------------------------------------------------------
+    # MAP self-recharge processes
+    # ------------------------------------------------------------------
+
+    def _start_map_recharge(self, stop_id: str):
+        """Start a self-recharge SimPy process for the MAP at *stop_id*."""
+        soc = self._map_soc[stop_id]
+        cap = self.map_battery_capacity_wh
+        if soc >= cap:
+            return
+        proc = self._recharge_procs.get(stop_id)
+        if proc is not None and proc.is_alive:
+            return
+        proc = self.env.process(self._map_recharge_process(stop_id))
+        self._recharge_procs[stop_id] = proc
+
+    def _map_recharge_process(self, stop_id: str):
+        """Generator: recharge a MAP at *stop_id* until full."""
+        cap = self.map_battery_capacity_wh
+        try:
+            while self._map_soc[stop_id] < cap:
+                needed = cap - self._map_soc[stop_id]
+                time_to_full = needed / self.map_recharge_rate_wh_s
+                yield self.env.timeout(time_to_full)
+                self._map_soc[stop_id] = cap
+                self._map_soc_history[stop_id].append((float(self.env.now), cap))
+        except simpy.Interrupt:
+            pass
+        finally:
+            self._recharge_procs.pop(stop_id, None)
+
+    def _interrupt_map_recharge(self, stop_id: str):
+        """Interrupt any ongoing recharge process for the MAP at *stop_id*."""
+        proc = self._recharge_procs.get(stop_id)
+        if proc is not None and proc.is_alive:
+            try:
+                proc.interrupt()
+            except RuntimeError:
+                pass
+
+    # ------------------------------------------------------------------
+    # Bus simulation
+    # ------------------------------------------------------------------
+
+    def _simulate_bus(self, bus_id: str, trip_ids: List[str]):
+        """SimPy generator for one bus."""
+        try:
+            line_id = bus_id.split('_')[0].replace('line', '')
+        except Exception:
+            line_id = "unknown"
+
+        capacity = self.battery_capacity_wh
+        self.bus_soc[bus_id] = capacity
+        self._bus_min_soc[bus_id] = capacity
+        self.bus_soc_history[bus_id].append((0.0, capacity))
+
+        current_time = 0.0
+        prev_end_node = None
+        prev_end_time = None
+
+        for trip_idx, trip_id in enumerate(trip_ids):
+            try:
+                seq = self.sim.gtfs.stop_sequence(trip_id)
+            except Exception:
+                continue
+            if not seq:
+                continue
+
+            trip_start = seq[0]["arrival"]
+            idle_dt = max(0.0, trip_start - current_time)
+
+            # --- Inter-trip layover phase ---
+            if idle_dt > 0:
+                try:
+                    start_node = self.sim.stop_node.get(seq[0].get("stop_id"))
+                except Exception:
+                    start_node = None
+
+                is_terminal = (
+                    prev_end_node is not None and start_node is not None
+                    and prev_end_node == start_node and prev_end_time is not None
+                )
+                start_stop_id = seq[0].get("stop_id")
+
+                if is_terminal and start_stop_id in self.trip_change_stops:
+                    duration = trip_start - prev_end_time
+                    soc_now = self.bus_soc.get(bus_id, capacity)
+
+                    next_trip_id = (trip_ids[trip_idx + 1]
+                                    if trip_idx + 1 < len(trip_ids) else None)
+                    layover = LayoverRecord(
+                        bus_id=bus_id,
+                        line_id=line_id,
+                        current_trip_id=trip_id,
+                        next_trip_id=next_trip_id,
+                        arrival_at_terminal_s=prev_end_time,
+                        departure_from_terminal_s=trip_start,
+                        layover_duration_s=duration,
+                        location=f"stop_{start_stop_id}",
+                        stop_id=start_stop_id,
+                        soc_at_arrival_wh=soc_now,
+                        soc_at_departure_wh=soc_now,
+                    )
+
+                    energy_before = self.bus_energy_charged[bus_id]
+                    yield from self._terminal_charge_baseline(
+                        bus_id, start_stop_id, duration, capacity)
+
+                    # Wait for remainder of layover
+                    time_used = float(self.env.now) - (trip_start - duration)
+                    remaining_idle = max(0.0, duration - time_used)
+                    if remaining_idle > 0:
+                        yield self.env.timeout(remaining_idle)
+
+                    energy_charged = self.bus_energy_charged[bus_id] - energy_before
+                    if energy_charged > 0:
+                        layover.was_charged = True
+                        layover.energy_charged_wh = energy_charged
+
+                    layover.soc_at_departure_wh = self.bus_soc.get(bus_id, capacity)
+                    self.layovers.append(layover)
+                    self.bus_soc_history[bus_id].append(
+                        (float(self.env.now), self.bus_soc.get(bus_id, capacity)))
+                else:
+                    yield self.env.timeout(idle_dt)
+
+                current_time = trip_start
+
+            # --- Trip segment execution ---
+            for i in range(1, len(seq)):
+                prev_stop = seq[i - 1]
+                curr_stop = seq[i]
+                dt = curr_stop["arrival"] - prev_stop["arrival"]
+
+                try:
+                    _, _, dist = self.sim.geod.inv(
+                        prev_stop["lon"], prev_stop["lat"],
+                        curr_stop["lon"], curr_stop["lat"]
+                    )
+                    dist = abs(dist)
+                except Exception:
+                    dist = 0.0
+
+                yield self.env.timeout(max(0.0, dt))
+                current_time = curr_stop["arrival"]
+
+                energy_consumed = dist * ENERGY_PER_METER_WH
+                prev_soc = self.bus_soc.get(bus_id, capacity)
+                new_soc = max(0.0, prev_soc - energy_consumed)
+                self.bus_soc[bus_id] = new_soc
+                self._bus_total_energy_consumed[bus_id] += energy_consumed
+                if new_soc < self._bus_min_soc.get(bus_id, capacity):
+                    self._bus_min_soc[bus_id] = new_soc
+
+                self.bus_soc_history[bus_id].append(
+                    (float(self.env.now), new_soc))
+
+            prev_end_node = self.sim.stop_node.get(seq[-1].get("stop_id"))
+            prev_end_time = seq[-1]["arrival"]
+
+    def _terminal_charge_baseline(self, bus_id: str, stop_id: str,
+                                   layover_duration_s: float, capacity: float):
+        """Generator: compete for the terminal charger with SOC-based preemption.
+
+        The bus requests the terminal PriorityResource using ``-soc_wh`` as the
+        priority (lower value = higher priority = served first).  If the
+        resource is held by a bus with higher SOC, it is preempted.
+        """
+        soc = self.bus_soc.get(bus_id, capacity)
+        target_wh = BUS_CHARGE_CUTOFF_SOC * capacity
+
+        if soc >= BUS_CHARGE_THRESHOLD_SOC * capacity:
+            return  # Bus does not need charging
+
+        charger = self._chargers.get(stop_id)
+        if charger is None:
+            return  # No MAP at this terminal
+
+        # Priority: lower numeric value = served first → use negative SOC
+        priority = -soc
+        req = charger.request(priority=priority, preempt=True)
+        t_request = float(self.env.now)
+
+        # Try to acquire the charger within the layover window
+        result = yield req | self.env.timeout(layover_duration_s)
+
+        if req not in result:
+            # Timeout — could not acquire charger in time
+            charger.release(req)
+            return
+
+        # Acquired the charger — preemption may have occurred
+        if req.preempt:
+            self._preemption_count += 1
+
+        # Stop MAP self-recharge while it is serving a bus
+        self._interrupt_map_recharge(stop_id)
+
+        t_start = float(self.env.now)
+        map_floor = MAP_MIN_SOC * self.map_battery_capacity_wh
+        available_map_energy = self._map_soc[stop_id] - map_floor
+
+        if available_map_energy <= 0:
+            charger.release(req)
+            self._start_map_recharge(stop_id)
+            return
+
+        # Re-read current bus SOC (may have changed while waiting)
+        soc = self.bus_soc.get(bus_id, capacity)
+        time_left = max(0.0, layover_duration_s - (t_start - t_request))
+        energy = min(
+            self.map_charging_rate_wh_s * time_left,
+            max(0.0, target_wh - soc),
+            available_map_energy
+        )
+        charge_dur = energy / self.map_charging_rate_wh_s if (
+            self.map_charging_rate_wh_s > 0 and energy > 0) else 0.0
+
+        if charge_dur > 0:
+            try:
+                yield self.env.timeout(charge_dur)
+            except simpy.Interrupt:
+                # Preempted by a lower-SOC bus
+                charge_dur = float(self.env.now) - t_start
+                energy = self.map_charging_rate_wh_s * charge_dur
+
+            soc_before = self.bus_soc.get(bus_id, capacity)
+            new_soc = min(capacity, soc_before + energy)
+            self.bus_soc[bus_id] = new_soc
+            self.bus_energy_charged[bus_id] += energy
+            # Deduct from MAP battery (never below floor)
+            self._map_soc[stop_id] = max(map_floor, self._map_soc[stop_id] - energy)
+            self._map_soc_history[stop_id].append(
+                (float(self.env.now), self._map_soc[stop_id]))
+            self.charging_events.append({
+                "bus_id": bus_id,
+                "stop_id": stop_id,
+                "start_time_s": t_start,
+                "end_time_s": float(self.env.now),
+                "energy_wh": energy,
+                "soc_before_wh": soc_before,
+                "soc_after_wh": new_soc,
+            })
+
+        charger.release(req)
+        # MAP resumes self-recharge if not immediately claimed by another bus
+        self._start_map_recharge(stop_id)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def run_simulation(self, duration_s: float = 86400) -> Dict:
+        """Run the baseline DES and return a results dict."""
+        print("\n" + "=" * 70)
+        print("BASELINE: STATIONARY-MAP TERMINAL CHARGING WITH PREEMPTION")
+        print("=" * 70)
+        print(f"Bus battery capacity:  {self.battery_capacity_wh/1000:,.1f} kWh")
+        print(f"MAP battery capacity:  {self.map_battery_capacity_wh/1000:,.1f} kWh")
+        print(f"MAP charging rate:     {self.map_charging_rate_wh_s:.2f} Wh/s")
+        print(f"MAP self-recharge:     {self.map_recharge_rate_wh_s:.2f} Wh/s")
+        print(f"Terminal stops:        {len(self.trip_change_stops)}")
+        print(f"  (one stationary MAP per terminal)")
+        print(f"Simulation duration:   {duration_s/3600:,.1f} hours\n")
+
+        for bus_id, trip_ids in self.bus_trips_dict.items():
+            self.env.process(self._simulate_bus(bus_id, trip_ids))
+
+        print(f"Running baseline simulation until t={duration_s}s...")
+        self.env.run(until=duration_s)
+        print(f"Baseline simulation complete!\n")
+
+        return self._collect_statistics()
+
+    def _collect_statistics(self) -> Dict:
+        bus_stats = {}
+        min_soc_overall = float('inf')
+        buses_below_floor: List[str] = []
+
+        for bus_id in self.bus_trips_dict:
+            capacity = self.battery_capacity_wh
+            soc_wh = self.bus_soc.get(bus_id, capacity)
+            min_soc_wh = self._bus_min_soc.get(bus_id, capacity)
+            min_soc_ratio = min_soc_wh / capacity
+
+            bus_stats[bus_id] = {
+                "final_soc_wh": soc_wh,
+                "final_soc_ratio": soc_wh / capacity,
+                "min_soc_wh": min_soc_wh,
+                "min_soc_ratio": min_soc_ratio,
+                "energy_charged_wh": self.bus_energy_charged.get(bus_id, 0.0),
+                "total_energy_consumed_wh": self._bus_total_energy_consumed.get(bus_id, 0.0),
+            }
+            min_soc_overall = min(min_soc_overall, min_soc_ratio)
+            if min_soc_ratio < BUS_MIN_SOC:
+                buses_below_floor.append(bus_id)
+
+        total_energy_charged = sum(self.bus_energy_charged.values())
+        num_terminals = len(self.trip_change_stops)
+        num_maps = num_terminals  # one per terminal
+
+        map_stats = {}
+        for stop_id in self.trip_change_stops:
+            soc_wh = self._map_soc[stop_id]
+            cap = self.map_battery_capacity_wh
+            map_stats[stop_id] = {
+                "final_soc_wh": soc_wh,
+                "final_soc_pct": soc_wh / cap * 100.0,
+            }
+
+        return {
+            "scenario": "baseline",
+            "battery_capacity_wh": self.battery_capacity_wh,
+            "num_maps": num_maps,
+            "num_terminals": num_terminals,
+            "charging_enabled": True,
+            "preemption_count": self._preemption_count,
+            "num_layovers": len(self.layovers),
+            "min_soc_overall_ratio": min_soc_overall if min_soc_overall < float('inf') else 1.0,
+            "feasible": min_soc_overall >= BUS_MIN_SOC,
+            "buses_below_floor": buses_below_floor,
+            "total_energy_charged_wh": total_energy_charged,
+            "bus_statistics": bus_stats,
+            "map_statistics": map_stats,
+        }
+
+    def print_results(self, results: Optional[Dict] = None):
+        """Print a summary of the baseline simulation results."""
+        if results is None:
+            results = self._collect_statistics()
+
+        print("\n" + "=" * 70)
+        print("BASELINE SIMULATION RESULTS")
+        print("=" * 70)
+        print(f"\nFEASIBILITY CHECK:")
+        print(f"  Bus battery capacity:  {results['battery_capacity_wh']/1000:,.1f} kWh")
+        print(f"  Terminals (= MAPs):    {results['num_terminals']}")
+        print(f"  Preemptions occurred:  {results['preemption_count']}")
+        print(f"  Minimum bus SOC seen:  {results['min_soc_overall_ratio']*100:.1f}%")
+        if results['feasible']:
+            print(f"  ✓ FEASIBLE: all buses stayed above {BUS_MIN_SOC*100:.0f}% SOC")
+        else:
+            n_fail = len(results['buses_below_floor'])
+            print(f"  ✗ INFEASIBLE: {n_fail} bus(es) fell below {BUS_MIN_SOC*100:.0f}% SOC")
+
+        print(f"\nCHARGING STATISTICS:")
+        print(f"  Total layovers:        {results['num_layovers']}")
+        print(f"  Total energy charged:  {results['total_energy_charged_wh']/1e6:,.3f} MWh")
+
+        if results['buses_below_floor']:
+            print(f"\nBuses that fell below {BUS_MIN_SOC*100:.0f}% SOC (first 10):")
+            for b in results['buses_below_floor'][:10]:
+                st = results['bus_statistics'][b]
+                print(f"  {b:<22} min={st['min_soc_ratio']*100:.1f}%  "
+                      f"charged={st['energy_charged_wh']/1000:.1f} kWh")
+            if len(results['buses_below_floor']) > 10:
+                print(f"  … and {len(results['buses_below_floor']) - 10} more")
+
+        print(f"\nMAP Final SOC by Terminal:")
+        for stop_id, ms in sorted(results['map_statistics'].items()):
+            bar = "█" * int(ms['final_soc_pct'] / 5)
+            print(f"  {stop_id:<16} {ms['final_soc_pct']:>6.1f}%  {bar}")
+
+        print("=" * 70 + "\n")
+
+    def plot_soc(self, save_path: str = "baseline_bus_soc.png"):
+        """Plot bus SOC trajectories for the baseline simulation."""
+        plt.figure(figsize=(14, 8))
+
+        cmap = plt.get_cmap("tab10")
+        lines_seen: Dict[str, object] = {}
+        next_color_idx = 0
+
+        for bus_id, series in self.bus_soc_history.items():
+            filtered = [x for x in series if x[0] > 0]
+            if not filtered:
+                continue
+            t = [x[0] / 3600 for x in filtered]
+            s = [x[1] / self.battery_capacity_wh * 100.0 for x in filtered]
+
+            line_key = "default"
+            try:
+                if bus_id.startswith("line"):
+                    line_key = bus_id[4:].split("_", 1)[0]
+            except Exception:
+                pass
+
+            if line_key not in lines_seen:
+                lines_seen[line_key] = cmap(next_color_idx % cmap.N)
+                next_color_idx += 1
+
+            plt.plot(t, s, color=lines_seen[line_key], linewidth=1, alpha=0.5)
+
+        plt.axhline(y=BUS_CHARGE_CUTOFF_SOC * 100, color="green", linestyle="--",
+                    linewidth=2, alpha=0.5, label=f"{BUS_CHARGE_CUTOFF_SOC*100:.0f}% target")
+        plt.axhline(y=BUS_CHARGE_THRESHOLD_SOC * 100, color="orange", linestyle="--",
+                    linewidth=2, alpha=0.5, label=f"{BUS_CHARGE_THRESHOLD_SOC*100:.0f}% threshold")
+        plt.axhline(y=BUS_MIN_SOC * 100, color="red", linestyle="--",
+                    linewidth=2, alpha=0.5, label=f"{BUS_MIN_SOC*100:.0f}% minimum")
+
+        plt.ylim(bottom=0, top=105)
+        plt.xlabel("Time (hours)", fontweight="bold")
+        plt.ylabel("Bus SOC (%)", fontweight="bold")
+        plt.title("Baseline — Bus SOC Trajectories (Terminal Charging, Preemption)",
+                  fontweight="bold")
+        plt.legend(loc="best")
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=300, bbox_inches="tight")
+        print(f"Plot saved to: {save_path}")
+        plt.close()
+
+    def plot_map_soc(self, save_path: str = "baseline_map_soc.png"):
+        """Plot MAP (terminal charger) SOC over time."""
+        has_data = any(
+            len(h) > 1 for h in self._map_soc_history.values()
+        )
+        if not has_data:
+            print("No MAP SOC history to plot (baseline)")
+            return
+
+        plt.figure(figsize=(14, 7))
+        n_stops = len(self.trip_change_stops)
+        cmap = plt.cm.tab10(np.linspace(0, 1, n_stops)) if n_stops > 0 else []
+
+        for idx, stop_id in enumerate(sorted(self.trip_change_stops)):
+            history = self._map_soc_history.get(stop_id, [])
+            if len(history) < 2:
+                continue
+            cap = self.map_battery_capacity_wh
+            times = [h[0] / 3600 for h in history]
+            soc_pct = [h[1] / cap * 100.0 for h in history]
+            plt.plot(times, soc_pct, linewidth=2,
+                     label=f"Terminal {stop_id}", color=cmap[idx])
+
+        plt.axhline(y=MAP_MIN_SOC * 100, color="red", linestyle="--",
+                    linewidth=1.5, alpha=0.8, label=f"{MAP_MIN_SOC*100:.0f}% floor")
+        plt.ylim(-5, 110)
+        plt.xlabel("Time (hours)", fontweight="bold", fontsize=12)
+        plt.ylabel("MAP SOC (%)", fontweight="bold", fontsize=12)
+        plt.title("Baseline — MAP (Terminal Charger) Battery SOC vs Time",
+                  fontweight="bold", fontsize=13)
+        plt.legend(loc="best", fontsize=8)
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=300, bbox_inches="tight")
+        print(f"Plot saved to: {save_path}")
+        plt.close()
+
+
+# ========================
 # SIMULATION RUNNER
 # ========================
 
@@ -2325,3 +2944,84 @@ def run_terminal_charging_simulation(sim, bus_trips_dict, bus_lines, trip_change
     stage2.plot_map_soc(save_path="map_soc_trajectories.png")
 
     return results, stage2
+
+
+def run_baseline_simulation(sim, bus_trips_dict, trip_change_stops,
+                            battery_capacity_wh: float = 250000,
+                            map_battery_capacity_wh: float = MAP_BATTERY_CAPACITY_WH,
+                            map_charging_rate_wh_s: float = MAP_CHARGING_RATE_WH_S,
+                            map_recharge_rate_wh_s: float = MAP_RECHARGE_RATE_WH_S,
+                            simulation_duration_s: float = 86400) -> Dict:
+    """Run the baseline stationary-MAP simulation and compare against the
+    offline charging-strategy optimum.
+
+    Baseline rules
+    --------------
+    * One MAP is permanently stationed at each terminal (trip-change stop).
+    * MAPs charge buses **only during terminal layovers** using preemption
+      (lowest-SOC bus is served first).
+    * MAPs self-recharge at their terminal depot when idle.
+    * No bus-following; no en-route charging.
+
+    After the simulation the function runs :class:`ChargingStrategyOptimizer`
+    (which performs an offline analysis using bus energy profiles) and calls
+    :meth:`ChargingStrategyOptimizer.compare_with_baseline` to determine
+    whether a more aggressive (dynamic/en-route) strategy would be beneficial.
+
+    Parameters
+    ----------
+    sim                      : GTFSBusSim instance
+    bus_trips_dict           : {bus_id: [trip_id, ...]}
+    trip_change_stops        : set of stop IDs that act as terminals
+    battery_capacity_wh      : bus battery capacity (Wh)
+    map_battery_capacity_wh  : MAP battery capacity (Wh)
+    map_charging_rate_wh_s   : MAP-to-bus charging rate (Wh/s)
+    map_recharge_rate_wh_s   : MAP self-recharge rate (Wh/s)
+    simulation_duration_s    : length of simulation (seconds)
+
+    Returns
+    -------
+    dict with keys ``baseline_results`` and ``comparison``.
+    """
+    # ------------------------------------------------------------------
+    # 1. Baseline DES simulation
+    # ------------------------------------------------------------------
+    baseline = BaselineTerminalChargingSimulation(
+        sim=sim,
+        bus_trips_dict=bus_trips_dict,
+        trip_change_stops=trip_change_stops,
+        initial_battery_capacity_wh=battery_capacity_wh,
+        map_battery_capacity_wh=map_battery_capacity_wh,
+        map_charging_rate_wh_s=map_charging_rate_wh_s,
+        map_recharge_rate_wh_s=map_recharge_rate_wh_s,
+    )
+    baseline_results = baseline.run_simulation(simulation_duration_s)
+    baseline.print_results(baseline_results)
+
+    # Plots
+    baseline.plot_soc(save_path="baseline_bus_soc.png")
+    baseline.plot_map_soc(save_path="baseline_map_soc.png")
+
+    # ------------------------------------------------------------------
+    # 2. Post-simulation: offline strategy analysis + comparison
+    # ------------------------------------------------------------------
+    num_terminals = len(trip_change_stops)
+    strategy_opt = ChargingStrategyOptimizer(
+        sim=sim,
+        bus_trips_dict=bus_trips_dict,
+        battery_capacity_wh=battery_capacity_wh,
+        num_maps=num_terminals,
+        map_battery_capacity_wh=map_battery_capacity_wh,
+        map_charging_rate_wh_s=map_charging_rate_wh_s,
+        trip_change_stops=trip_change_stops,
+    )
+    strategy_opt.print_summary()
+
+    comparison = strategy_opt.compare_with_baseline(baseline_results)
+
+    return {
+        "baseline_results": baseline_results,
+        "comparison": comparison,
+        "baseline_sim": baseline,
+        "strategy_optimizer": strategy_opt,
+    }
