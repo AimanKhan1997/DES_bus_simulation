@@ -2306,8 +2306,19 @@ class BaselineTerminalChargingSimulation:
                  initial_battery_capacity_wh: float = 250000,
                  map_battery_capacity_wh: float = MAP_BATTERY_CAPACITY_WH,
                  map_charging_rate_wh_s: float = MAP_CHARGING_RATE_WH_S,
-                 map_recharge_rate_wh_s: float = MAP_RECHARGE_RATE_WH_S):
-
+                 map_recharge_rate_wh_s: float = MAP_RECHARGE_RATE_WH_S,
+                 preemption_threshold: Optional[float] = None):
+        """
+        Parameters
+        ----------
+        preemption_threshold : float or None
+            SOC fraction (0–1) below which a bus will request the charger and
+            participate in preemptive scheduling.  When *None* (the default)
+            the threshold is derived automatically by running
+            :class:`PreemptionStrategyAnalyzer` on the provided bus trips,
+            which accounts for actual energy consumption patterns.
+            Pass an explicit value to override the automatic recommendation.
+        """
         self.sim = sim
         self.bus_trips_dict = bus_trips_dict
         self.trip_change_stops = trip_change_stops
@@ -2315,6 +2326,29 @@ class BaselineTerminalChargingSimulation:
         self.map_battery_capacity_wh = map_battery_capacity_wh
         self.map_charging_rate_wh_s = map_charging_rate_wh_s
         self.map_recharge_rate_wh_s = map_recharge_rate_wh_s
+
+        # ----------------------------------------------------------------
+        # Determine the preemption threshold
+        # ----------------------------------------------------------------
+        if preemption_threshold is not None:
+            self.preemption_threshold = float(preemption_threshold)
+            print(f"\nBaseline preemption threshold (provided): "
+                  f"{self.preemption_threshold*100:.1f}% SOC")
+        else:
+            print("\nAnalyzing bus energy patterns for baseline preemption threshold …")
+            num_maps = max(1, len(trip_change_stops))
+            analyzer = PreemptionStrategyAnalyzer(
+                sim, bus_trips_dict, initial_battery_capacity_wh, num_maps
+            )
+            self.preemption_threshold = analyzer.recommend_preemption_threshold()
+            if self.preemption_threshold is None:
+                # Fallback (e.g. no trips analyzed)
+                self.preemption_threshold = BUS_CHARGE_THRESHOLD_SOC
+                print(f"  Could not determine threshold — using default "
+                      f"{BUS_CHARGE_THRESHOLD_SOC*100:.0f}% SOC")
+            else:
+                print(f"  PreemptionStrategyAnalyzer recommended threshold: "
+                      f"{self.preemption_threshold*100:.1f}% SOC")
 
         self.env = simpy.Environment()
 
@@ -2522,8 +2556,8 @@ class BaselineTerminalChargingSimulation:
         soc = self.bus_soc.get(bus_id, capacity)
         target_wh = BUS_CHARGE_CUTOFF_SOC * capacity
 
-        if soc >= BUS_CHARGE_THRESHOLD_SOC * capacity:
-            return  # Bus does not need charging
+        if soc >= self.preemption_threshold * capacity:
+            return  # Bus SOC is above threshold — no charging needed
 
         charger = self._chargers.get(stop_id)
         if charger is None:
@@ -2612,6 +2646,7 @@ class BaselineTerminalChargingSimulation:
         print(f"MAP battery capacity:  {self.map_battery_capacity_wh/1000:,.1f} kWh")
         print(f"MAP charging rate:     {self.map_charging_rate_wh_s:.2f} Wh/s")
         print(f"MAP self-recharge:     {self.map_recharge_rate_wh_s:.2f} Wh/s")
+        print(f"Preemption threshold:  {self.preemption_threshold*100:.1f}% SOC")
         print(f"Terminal stops:        {len(self.trip_change_stops)}")
         print(f"  (one stationary MAP per terminal)")
         print(f"Simulation duration:   {duration_s/3600:,.1f} hours\n")
@@ -2667,6 +2702,7 @@ class BaselineTerminalChargingSimulation:
             "num_maps": num_maps,
             "num_terminals": num_terminals,
             "charging_enabled": True,
+            "preemption_threshold": self.preemption_threshold,
             "preemption_count": self._preemption_count,
             "num_layovers": len(self.layovers),
             "min_soc_overall_ratio": min_soc_overall if min_soc_overall < float('inf') else 1.0,
@@ -2688,6 +2724,9 @@ class BaselineTerminalChargingSimulation:
         print(f"\nFEASIBILITY CHECK:")
         print(f"  Bus battery capacity:  {results['battery_capacity_wh']/1000:,.1f} kWh")
         print(f"  Terminals (= MAPs):    {results['num_terminals']}")
+        thr = results.get('preemption_threshold')
+        if thr is not None:
+            print(f"  Preemption threshold:  {thr*100:.1f}% SOC")
         print(f"  Preemptions occurred:  {results['preemption_count']}")
         print(f"  Minimum bus SOC seen:  {results['min_soc_overall_ratio']*100:.1f}%")
         if results['feasible']:
@@ -2951,6 +2990,7 @@ def run_baseline_simulation(sim, bus_trips_dict, trip_change_stops,
                             map_battery_capacity_wh: float = MAP_BATTERY_CAPACITY_WH,
                             map_charging_rate_wh_s: float = MAP_CHARGING_RATE_WH_S,
                             map_recharge_rate_wh_s: float = MAP_RECHARGE_RATE_WH_S,
+                            preemption_threshold: Optional[float] = None,
                             simulation_duration_s: float = 86400) -> Dict:
     """Run the baseline stationary-MAP simulation and compare against the
     offline charging-strategy optimum.
@@ -2962,6 +3002,9 @@ def run_baseline_simulation(sim, bus_trips_dict, trip_change_stops,
       (lowest-SOC bus is served first).
     * MAPs self-recharge at their terminal depot when idle.
     * No bus-following; no en-route charging.
+    * The SOC threshold that triggers charging (and drives preemption priority)
+      is obtained from :class:`PreemptionStrategyAnalyzer` unless an explicit
+      value is supplied via *preemption_threshold*.
 
     After the simulation the function runs :class:`ChargingStrategyOptimizer`
     (which performs an offline analysis using bus energy profiles) and calls
@@ -2977,6 +3020,10 @@ def run_baseline_simulation(sim, bus_trips_dict, trip_change_stops,
     map_battery_capacity_wh  : MAP battery capacity (Wh)
     map_charging_rate_wh_s   : MAP-to-bus charging rate (Wh/s)
     map_recharge_rate_wh_s   : MAP self-recharge rate (Wh/s)
+    preemption_threshold     : SOC fraction (0–1) below which a bus will
+                               request the charger.  Pass *None* (default) to
+                               let :class:`PreemptionStrategyAnalyzer` choose
+                               the value automatically.
     simulation_duration_s    : length of simulation (seconds)
 
     Returns
@@ -2994,6 +3041,7 @@ def run_baseline_simulation(sim, bus_trips_dict, trip_change_stops,
         map_battery_capacity_wh=map_battery_capacity_wh,
         map_charging_rate_wh_s=map_charging_rate_wh_s,
         map_recharge_rate_wh_s=map_recharge_rate_wh_s,
+        preemption_threshold=preemption_threshold,
     )
     baseline_results = baseline.run_simulation(simulation_duration_s)
     baseline.print_results(baseline_results)

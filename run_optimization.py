@@ -124,7 +124,7 @@ def compute_trip_change_stops(sim, bus_trips_dict):
 # ---------------------------------------------------------------------------
 
 def run_baseline_mode(sim, bus_trips, bus_lines, trip_change_stops,
-                      battery_kwh, duration_s):
+                      battery_kwh, duration_s, preemption_threshold=None):
     """Run the stationary-MAP baseline + post-simulation strategy comparison."""
     print("\n" + "=" * 70)
     print("MODE: BASELINE — STATIONARY MAPs + STRATEGY COMPARISON")
@@ -135,6 +135,7 @@ def run_baseline_mode(sim, bus_trips, bus_lines, trip_change_stops,
         bus_trips_dict=bus_trips,
         trip_change_stops=trip_change_stops,
         battery_capacity_wh=battery_kwh * 1000,
+        preemption_threshold=preemption_threshold,
         simulation_duration_s=duration_s,
     )
 
@@ -144,12 +145,15 @@ def run_baseline_mode(sim, bus_trips, bus_lines, trip_change_stops,
     print("\n" + "=" * 70)
     print("BASELINE PIPELINE COMPLETE")
     print("=" * 70)
+    thr = br.get("preemption_threshold")
+    if thr is not None:
+        print(f"  Preemption threshold:       {thr*100:.1f}% SOC")
     print(f"  Baseline feasible:          {'✓ YES' if br['feasible'] else '✗ NO'}")
     print(f"  Minimum bus SOC:            {br['min_soc_overall_ratio']*100:.1f}%")
     print(f"  Buses below 20% floor:      {len(br['buses_below_floor'])}")
     print(f"  Preemptions:                {br['preemption_count']}")
     print(f"  Total energy charged:       {br['total_energy_charged_wh']/1e6:,.3f} MWh")
-    if cmp["dynamic_strategy_improves"]:
+    if cmp.get("dynamic_strategy_improves"):
         print("\n  ⚡ Recommendation: run with --mode dynamic (or --mode full)")
         print("     to deploy en-route / hybrid MAP charging.")
     else:
@@ -190,7 +194,7 @@ def run_dynamic_mode(sim, bus_trips, bus_lines, trip_change_stops,
 
 
 def run_full_mode(sim, bus_trips, bus_lines, trip_change_stops,
-                  battery_kwh, num_maps, duration_s):
+                  battery_kwh, num_maps, duration_s, preemption_threshold=None):
     """Run baseline then dynamic simulation and print a side-by-side summary."""
     print("\n" + "=" * 70)
     print("MODE: FULL — BASELINE THEN DYNAMIC (SIDE-BY-SIDE COMPARISON)")
@@ -200,6 +204,7 @@ def run_full_mode(sim, bus_trips, bus_lines, trip_change_stops,
     baseline_out = run_baseline_mode(
         sim, bus_trips, bus_lines, trip_change_stops,
         battery_kwh, duration_s,
+        preemption_threshold=preemption_threshold,
     )
 
     # Phase 2: Dynamic
@@ -215,6 +220,9 @@ def run_full_mode(sim, bus_trips, bus_lines, trip_change_stops,
     print("\n" + "=" * 70)
     print("SIDE-BY-SIDE COMPARISON: BASELINE vs DYNAMIC")
     print("=" * 70)
+    thr = br.get("preemption_threshold")
+    if thr is not None:
+        print(f"  (Baseline preemption threshold: {thr*100:.1f}% SOC)\n")
     print(f"\n{'Metric':<35} {'Baseline':>15} {'Dynamic':>15}")
     print("-" * 70)
     print(f"{'Feasible':<35} "
@@ -296,6 +304,17 @@ def parse_args():
         metavar="LINE",
         help="Route IDs to simulate (default: 1 2 3 4 6)",
     )
+    parser.add_argument(
+        "--preemption-threshold",
+        type=float,
+        default=None,
+        metavar="SOC",
+        help=(
+            "SOC fraction (0–1) at which a bus requests the terminal charger "
+            "in baseline/full modes.  When omitted the threshold is derived "
+            "automatically by PreemptionStrategyAnalyzer (recommended)."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -311,6 +330,11 @@ def main():
     print(f"  Battery:        {args.battery_kwh} kWh")
     if args.mode in ("dynamic", "full"):
         print(f"  MAPs (dynamic): {args.num_maps}")
+    if args.mode in ("baseline", "full"):
+        if args.preemption_threshold is not None:
+            print(f"  Preemption thr: {args.preemption_threshold*100:.1f}% SOC (override)")
+        else:
+            print(f"  Preemption thr: auto (PreemptionStrategyAnalyzer)")
     print(f"  Duration:       {args.duration_h:.1f} h")
     print(f"  Lines:          {', '.join(args.lines)}")
     print("=" * 70)
@@ -345,6 +369,7 @@ def main():
             run_baseline_mode(
                 sim, bus_trips, bus_lines, trip_change_stops,
                 args.battery_kwh, duration_s,
+                preemption_threshold=args.preemption_threshold,
             )
         elif args.mode == "dynamic":
             run_dynamic_mode(
@@ -355,6 +380,7 @@ def main():
             run_full_mode(
                 sim, bus_trips, bus_lines, trip_change_stops,
                 args.battery_kwh, args.num_maps, duration_s,
+                preemption_threshold=args.preemption_threshold,
             )
     except Exception as e:
         print(f"ERROR during simulation: {e}")
