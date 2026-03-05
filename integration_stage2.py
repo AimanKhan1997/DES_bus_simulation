@@ -7,7 +7,7 @@ import simpy
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Union
 from collections import defaultdict
 import heapq
 from dataclasses import dataclass
@@ -28,6 +28,11 @@ MAX_CONCURRENT_CHARGERS = 2
 CHARGER_SPEED_MS = 27.78
 ENERGY_PER_METER_WH = 2.7
 
+MAP_ENERGY_PER_METER_WH = 0.3       # MAP energy consumption per metre of travel (Wh/m)
+MAP_RECHARGE_RATE_WH_S = 233.33     # Rate at which idle MAPs self-recharge (Wh/s)
+MAP_BATTERY_CAPACITY_WH = 100000    # Default MAP battery capacity (100 kWh)
+MAP_MIN_SOC = 0.10                  # MAPs must stay above 10 % SOC at all times
+
 # ========================
 # MAP USAGE TRACKER (NEW)
 # ========================
@@ -44,6 +49,7 @@ class MAPChargingRecord:
     location: str
     soc_before_wh: float
     soc_after_wh: float
+    charging_type: str = "terminal"  # "terminal", "en_route_stop", "en_route_segment"
 
 @dataclass
 class MAPMovementRecord:
@@ -56,12 +62,13 @@ class MAPMovementRecord:
     distance_m: float
     duration_s: float
     associated_bus_id: Optional[str] = None
+    movement_type: str = "independent"  # "independent", "following_bus"
 
 @dataclass
 class MAPState:
     """Current state of a MAP"""
     map_id: int
-    current_location: str  # stop_id, segment_id, or "depot"
+    current_location: Optional[str]  # stop_id, or None when unspawned
     current_time_s: float
     current_soc_wh: float
     battery_capacity_wh: float
@@ -72,6 +79,11 @@ class MAPState:
     distance_traveled_m: float = 0.0
     total_charging_time_s: float = 0.0
     num_charging_events: int = 0
+    spawned: bool = False          # False = unspawned (not yet deployed)
+    is_following_bus: bool = False  # True = attached to a bus, moving with it
+    is_recharging: bool = False    # True = MAP is self-recharging (unavailable for bus charging)
+    current_lat: Optional[float] = None
+    current_lon: Optional[float] = None
 
 class MAPUsageTracker:
     """Tracks MAP usage and charging statistics"""
@@ -91,7 +103,8 @@ class MAPUsageTracker:
 
     def record_charge(self, map_id: int, bus_id: str, start_time: float,
                      end_time: float, energy_wh: float, location: str,
-                     soc_before: float, soc_after: float):
+                     soc_before: float, soc_after: float,
+                     charging_type: str = "terminal"):
         """Record a charging event"""
 
         duration = end_time - start_time
@@ -104,7 +117,8 @@ class MAPUsageTracker:
             energy_delivered_wh=energy_wh,
             location=location,
             soc_before_wh=soc_before,
-            soc_after_wh=soc_after
+            soc_after_wh=soc_after,
+            charging_type=charging_type
         )
 
         self.charging_records.append(record)
@@ -116,7 +130,8 @@ class MAPUsageTracker:
 
     def record_movement(self, map_id: int, start_time: float, end_time: float,
                        from_location: str, to_location: str, distance_m: float,
-                       associated_bus_id: Optional[str] = None):
+                       associated_bus_id: Optional[str] = None,
+                       movement_type: str = "independent"):
         """Record a MAP movement event"""
         duration = end_time - start_time
         record = MAPMovementRecord(
@@ -127,7 +142,8 @@ class MAPUsageTracker:
             to_location=to_location,
             distance_m=distance_m,
             duration_s=duration,
-            associated_bus_id=associated_bus_id
+            associated_bus_id=associated_bus_id,
+            movement_type=movement_type
         )
         self.movement_records.append(record)
         self.map_total_distance_m[map_id] += distance_m
@@ -154,13 +170,27 @@ class MAPUsageTracker:
                 'num_movements': self.map_movement_events[map_id]
             }
 
+        # Breakdown by charging type
+        charging_type_breakdown = defaultdict(lambda: {'events': 0, 'energy_wh': 0.0})
+        for record in self.charging_records:
+            charging_type_breakdown[record.charging_type]['events'] += 1
+            charging_type_breakdown[record.charging_type]['energy_wh'] += record.energy_delivered_wh
+
+        # Breakdown by movement type
+        movement_type_breakdown = defaultdict(lambda: {'events': 0, 'distance_m': 0.0})
+        for record in self.movement_records:
+            movement_type_breakdown[record.movement_type]['events'] += 1
+            movement_type_breakdown[record.movement_type]['distance_m'] += record.distance_m
+
         return {
             'total_energy_wh': total_energy,
             'total_time_s': total_time,
             'num_events': sum(self.map_num_events.values()),
             'map_summaries': map_summaries,
             'total_distance_m': total_distance,
-            'total_movements': sum(self.map_movement_events.values())
+            'total_movements': sum(self.map_movement_events.values()),
+            'charging_type_breakdown': dict(charging_type_breakdown),
+            'movement_type_breakdown': dict(movement_type_breakdown),
         }
 
     def print_summary(self, battery_capacity_wh: float):
@@ -181,6 +211,22 @@ class MAPUsageTracker:
 
         if summary['num_events'] > 0:
             print(f"  Average energy per event: {summary['total_energy_wh']/summary['num_events']/1000:,.0f} kWh")
+
+        # Charging type breakdown
+        ct_breakdown = summary.get('charging_type_breakdown', {})
+        if ct_breakdown:
+            print(f"\nCharging Type Breakdown:")
+            for ctype, stats in sorted(ct_breakdown.items()):
+                print(f"  {ctype:<20}: {stats['events']:>5} events, "
+                      f"{stats['energy_wh']/1000:,.1f} kWh")
+
+        # Movement type breakdown
+        mv_breakdown = summary.get('movement_type_breakdown', {})
+        if mv_breakdown:
+            print(f"\nMovement Type Breakdown:")
+            for mtype, stats in sorted(mv_breakdown.items()):
+                print(f"  {mtype:<20}: {stats['events']:>5} events, "
+                      f"{stats['distance_m']/1000:,.1f} km")
 
         print(f"\nPer-MAP Statistics:")
         print("-"*100)
@@ -472,306 +518,6 @@ class ChargingPolicy:
         return min(remaining, possible)
 
 # ========================
-# STOP CHARGING MANAGER WITH MAP TRACKING
-# ========================
-
-@dataclass
-class ChargingSession:
-    """Represents an active charging session"""
-    bus_id: str
-    stop_id: str
-    start_time: float
-    soc_at_start: float
-    capacity: float
-    target_soc: float
-    process_handle: any
-    interrupted: bool = False
-    map_id: int = -1
-
-class PreemptiveStopChargingManager:
-    """Manage exclusive charging slots with MAP tracking"""
-
-    def __init__(self, env: simpy.Environment, capacity_per_stop: int = 1,
-                 policy: ChargingPolicy = None, on_charge=None,
-                 preemption_threshold: Optional[float] = 0.40,
-                 num_maps: int = 1,
-                 map_tracker: Optional[MAPUsageTracker] = None):
-        self.env = env
-        self.capacity = max(1, int(capacity_per_stop))
-        self.policy = policy or ChargingPolicy()
-        self.on_charge = on_charge
-        self.preemption_threshold = preemption_threshold
-        self.num_maps = num_maps
-        self.map_tracker = map_tracker
-
-        self.charging_enabled = (num_maps > 0)
-
-        self._active_counts = defaultdict(int)
-        self._queues = defaultdict(list)
-        self._high_priority_queues = defaultdict(list)
-        self._logs = defaultdict(list)
-        self._charging_events = []
-        self._active_sessions = {}
-        self._preemption_events = []
-        self._current_map_id = 0
-        self._global_active_count = 0  # Track total buses charging across all stops
-        self._buses_currently_charging = set()  # Track which buses are actively charging
-        self._map_locations = {}  # Track MAP locations {map_id: stop_id}
-
-    def _can_start(self, stop_id: str) -> bool:
-        if not self.charging_enabled:
-            return False
-        # Check global limit: only allow as many buses charging as there are MAPs
-        return self._global_active_count < self.num_maps
-
-    def _get_next_map_id(self) -> int:
-        """Get next MAP in round-robin fashion"""
-        map_id = self._current_map_id % self.num_maps
-        self._current_map_id += 1
-        return map_id
-
-    def _start_session(self, stop_id: str, req: dict):
-        """Start a charging session with MAP tracking and location verification"""
-        if not self.charging_enabled:
-            return (False, 0.0, 0.0)
-
-        bus_id = req["bus_id"]
-        soc = req["soc"]
-        cap = req["capacity"]
-        desired = req["desired"]
-
-        # Check if bus is already being charged
-        if bus_id in self._buses_currently_charging:
-            return (False, 0.0, 0.0)
-
-        amount = self.policy.charge_amount_for_duration(soc, cap, desired)
-        if amount <= 0 or desired <= 0:
-            return (False, 0.0, 0.0)
-
-        duration = min(amount / self.policy.rate_wh_per_s, desired)
-
-        # Assign MAP and set its location
-        map_id = self._get_next_map_id()
-        self._map_locations[map_id] = stop_id  # MAP arrives at stop location
-
-        # Verify MAP is at the same location as the bus (both at stop_id)
-        if map_id in self._map_locations and self._map_locations[map_id] != stop_id:
-            return (False, 0.0, 0.0)
-
-        # Mark bus as currently charging
-        self._buses_currently_charging.add(bus_id)
-        self._global_active_count += 1
-        self._active_counts[stop_id] += 1
-        start_time = float(self.env.now)
-
-        entry = {
-            "bus_id": bus_id,
-            "start_time": start_time,
-            "duration_s": duration,
-            "amount_wh": amount,
-            "map_id": map_id
-        }
-        self._logs[stop_id].append(entry)
-
-        charging_event = {
-            "bus_id": bus_id,
-            "stop_id": stop_id,
-            "start_time_s": start_time,
-            "duration_s": duration,
-            "energy_wh": amount,
-            "preempted": False,
-            "map_id": map_id
-        }
-        self._charging_events.append(charging_event)
-
-        if callable(self.on_charge):
-            try:
-                self.on_charge(bus_id, amount, duration)
-            except Exception:
-                pass
-
-        session = ChargingSession(
-            bus_id=bus_id,
-            stop_id=stop_id,
-            start_time=start_time,
-            soc_at_start=soc,
-            capacity=cap,
-            target_soc=min(cap, soc + amount),
-            process_handle=None,
-            map_id=map_id
-        )
-
-        def _release(sid, dur, sess):
-            try:
-                yield self.env.timeout(dur)
-                if not sess.interrupted:
-                    if self.map_tracker:
-                        self.map_tracker.record_charge(
-                            map_id=sess.map_id,
-                            bus_id=sess.bus_id,
-                            start_time=sess.start_time,
-                            end_time=float(self.env.now),
-                            energy_wh=soc + amount - sess.soc_at_start,
-                            location=f"stop_{sid}",
-                            soc_before=sess.soc_at_start,
-                            soc_after=min(cap, sess.soc_at_start + amount)
-                        )
-
-                    # Release resources
-                    self._global_active_count = max(0, self._global_active_count - 1)
-                    self._active_counts[sid] = max(0, self._active_counts.get(sid, 1) - 1)
-                    self._buses_currently_charging.discard(sess.bus_id)
-                    self._assign_next_for_stop(sid)
-            except Exception:
-                pass
-
-        process = self.env.process(_release(stop_id, duration, session))
-        session.process_handle = process
-        self._active_sessions[(stop_id, bus_id)] = session
-
-        return (True, duration, amount)
-
-    def _assign_next_for_stop(self, stop_id: str):
-        """Assign next queued request"""
-
-        if not self.charging_enabled:
-            return
-
-        hp_queue = self._high_priority_queues.get(stop_id, [])
-        if hp_queue:
-            now = float(self.env.now)
-            alive = []
-            for r in hp_queue:
-                elapsed = now - r["requested_time"]
-                remaining = r["desired"] - elapsed
-                if remaining > 0:
-                    newr = r.copy()
-                    newr["desired"] = remaining
-                    alive.append(newr)
-
-            self._high_priority_queues[stop_id] = alive
-            if alive and self._can_start(stop_id):
-                req = alive.pop(0)
-                self._high_priority_queues[stop_id] = alive
-                self._start_session(stop_id, req)
-                return
-
-        q = self._queues.get(stop_id, [])
-        if not q:
-            return
-
-        now = float(self.env.now)
-        alive = []
-        for r in q:
-            elapsed = now - r["requested_time"]
-            remaining = r["desired"] - elapsed
-            if remaining > 0:
-                newr = r.copy()
-                newr["desired"] = remaining
-                alive.append(newr)
-
-        self._queues[stop_id] = alive
-        if not alive:
-            return
-
-        alive.sort(key=lambda x: (x["soc"], x["requested_time"]))
-
-        if self._can_start(stop_id):
-            req = alive.pop(0)
-            self._queues[stop_id] = alive
-            self._start_session(stop_id, req)
-
-    def request_stop_charging(self, stop_id: str, bus_id: str, soc_wh: float,
-                             capacity_wh: float, desired_duration_s: float):
-        """Request charging"""
-
-        if not self.charging_enabled:
-            return (False, 0.0, 0.0)
-
-        if not stop_id:
-            return (False, 0.0, 0.0)
-
-        if not self.policy.wants_charge(soc_wh, capacity_wh):
-            return (False, 0.0, 0.0)
-
-        req = {
-            "bus_id": bus_id,
-            "soc": soc_wh,
-            "capacity": capacity_wh,
-            "desired": desired_duration_s,
-            "requested_time": float(self.env.now)
-        }
-
-        soc_ratio = soc_wh / capacity_wh if capacity_wh > 0 else 0
-        is_high_priority = self.preemption_threshold is not None and soc_ratio < self.preemption_threshold
-
-        if is_high_priority:
-            for key, session in list(self._active_sessions.items()):
-                if key[0] == stop_id and not session.interrupted:
-                    current_soc_ratio = session.soc_at_start / session.capacity if session.capacity > 0 else 0
-
-                    if self.preemption_threshold is not None and current_soc_ratio >= self.preemption_threshold:
-                        self._preempt_session(stop_id, session, bus_id, soc_wh)
-                        if self._can_start(stop_id):
-                            return self._start_session(stop_id, req)
-
-        if self._can_start(stop_id):
-            return self._start_session(stop_id, req)
-
-        if is_high_priority:
-            self._high_priority_queues[stop_id].append(req)
-        else:
-            self._queues[stop_id].append(req)
-
-        return (False, 0.0, 0.0)
-
-    def _preempt_session(self, stop_id: str, session: ChargingSession,
-                        new_bus_id: str, new_bus_soc: float):
-        """Preempt a charging session"""
-
-        session.interrupted = True
-
-        preemption_event = {
-            "stop_id": stop_id,
-            "interrupted_bus": session.bus_id,
-            "new_bus": new_bus_id,
-            "time_s": float(self.env.now),
-            "interrupted_bus_soc": session.soc_at_start,
-            "new_bus_soc": new_bus_soc,
-            "soc_difference": (new_bus_soc - session.soc_at_start) / session.capacity if session.capacity > 0 else 0,
-            "map_id": session.map_id
-        }
-        self._preemption_events.append(preemption_event)
-
-        for event in reversed(self._charging_events):
-            if event["bus_id"] == session.bus_id and event["stop_id"] == stop_id:
-                event["preempted"] = True
-                break
-
-        if session.process_handle:
-            try:
-                session.process_handle.interrupt()
-            except Exception:
-                pass
-
-        self._global_active_count = max(0, self._global_active_count - 1)
-        self._active_counts[stop_id] = max(0, self._active_counts.get(stop_id, 1) - 1)
-        self._buses_currently_charging.discard(session.bus_id)
-
-        for key in list(self._active_sessions.keys()):
-            if key == (stop_id, session.bus_id):
-                del self._active_sessions[key]
-
-    def get_stop_logs(self):
-        return {sid: list(logs) for sid, logs in self._logs.items()}
-
-    def get_charging_events(self):
-        return list(self._charging_events)
-
-    def get_preemption_events(self):
-        return list(self._preemption_events)
-
-# ========================
 # MAP MOVEMENT SCHEDULER (NEW)
 # ========================
 
@@ -779,7 +525,7 @@ class MAPMovementScheduler:
     """Manages MAP movement, routing, and location tracking"""
 
     def __init__(self, env: simpy.Environment, num_maps: int,
-                 map_battery_capacity_wh: float = 100000,
+                 map_battery_capacity_wh: Optional[Union[float, List[float]]] = None,
                  map_speed_ms: float = 27.78,
                  map_tracker: Optional[MAPUsageTracker] = None):
         self.env = env
@@ -787,16 +533,39 @@ class MAPMovementScheduler:
         self.map_speed_ms = map_speed_ms
         self.map_tracker = map_tracker
 
-        # MAP states indexed by map_id
+        # Resolve per-MAP battery capacities (float → same for all; list → per-MAP)
+        if map_battery_capacity_wh is None:
+            capacities = [MAP_BATTERY_CAPACITY_WH] * num_maps
+        elif isinstance(map_battery_capacity_wh, (list, tuple)):
+            capacities = list(map_battery_capacity_wh)
+            # Pad or trim to num_maps
+            while len(capacities) < num_maps:
+                capacities.append(capacities[-1] if capacities else MAP_BATTERY_CAPACITY_WH)
+            capacities = capacities[:num_maps]
+        else:
+            capacities = [float(map_battery_capacity_wh)] * num_maps
+
+        # MAP states indexed by map_id — start unspawned (current_location=None)
         self.map_states = {}
         for map_id in range(num_maps):
+            cap = capacities[map_id]
             self.map_states[map_id] = MAPState(
                 map_id=map_id,
-                current_location="depot",
+                current_location=None,  # unspawned
                 current_time_s=0.0,
-                current_soc_wh=map_battery_capacity_wh,
-                battery_capacity_wh=map_battery_capacity_wh,
+                current_soc_wh=cap,
+                battery_capacity_wh=cap,
+                spawned=False,
             )
+
+        # MAP SOC history for plotting: {map_id: [(time_s, soc_wh), ...]}
+        self.map_soc_history: Dict[int, List] = defaultdict(list)
+        # Record initial SOC for each MAP
+        for map_id in range(num_maps):
+            self.map_soc_history[map_id].append((0.0, self.map_states[map_id].current_soc_wh))
+
+        # SimPy process handles for self-recharging: {map_id: simpy.Process}
+        self.map_recharge_processes: Dict[int, object] = {}
 
         # Request queue for MAP assignments
         self.charging_requests = defaultdict(list)  # {map_id: [requests]}
@@ -817,13 +586,18 @@ class MAPMovementScheduler:
         except Exception as e:
             print(f"Warning: Could not set stop locations: {e}")
 
+    def record_map_soc(self, map_id: int, time_s: float):
+        """Record the current MAP SOC at the given simulation time."""
+        state = self.map_states.get(map_id)
+        if state is not None:
+            self.map_soc_history[map_id].append((time_s, state.current_soc_wh))
+
     def calculate_travel_time(self, from_location: str, to_location: str) -> Tuple[float, float]:
         """Calculate travel time and distance between two locations (in meters and seconds)
 
         Returns: (distance_m, time_s)
         """
         if from_location not in self.stop_locations or to_location not in self.stop_locations:
-            # If locations unknown, return default (0 distance, 0 time)
             return (0.0, 0.0)
 
         lat1, lon1 = self.stop_locations[from_location]
@@ -837,54 +611,188 @@ class MAPMovementScheduler:
         except Exception:
             return (0.0, 0.0)
 
-    def assign_map_to_bus(self, map_id: int, bus_id: str, current_location: str,
-                         target_location: str) -> Optional[Tuple[float, float]]:
-        """Assign a MAP to move to a bus location
+    def spawn_or_travel_to(self, map_id: int, target_stop_id: str,
+                           target_lat: Optional[float] = None,
+                           target_lon: Optional[float] = None) -> Tuple[float, float]:
+        """Spawn MAP at target on first use (zero travel time), or travel there if already spawned.
 
-        Returns: (travel_time_s, distance_m) or None if invalid
+        Returns: (travel_time_s, distance_m)
         """
-        if map_id < 0 or map_id >= self.num_maps:
-            return None
+        state = self.map_states.get(map_id)
+        if state is None:
+            return (0.0, 0.0)
 
-        map_state = self.map_states.get(map_id)
-        if map_state is None:
-            return None
+        if not state.spawned:
+            # First use: spawn instantly at target
+            state.current_location = target_stop_id
+            state.current_lat = target_lat
+            state.current_lon = target_lon
+            state.spawned = True
+            state.arrival_time_at_target_s = float(self.env.now)
+            return (0.0, 0.0)
 
-        distance_m, travel_time_s = self.calculate_travel_time(map_state.current_location, target_location)
+        # Already spawned: calculate travel from current location
+        from_loc = state.current_location or "unknown"
+        distance_m, travel_time_s = self.calculate_travel_time(from_loc, target_stop_id)
 
-        if travel_time_s > 0:
-            # Schedule movement
-            def move_process():
-                yield self.env.timeout(travel_time_s)
+        if self.map_tracker and from_loc != target_stop_id:
+            self.map_tracker.record_movement(
+                map_id=map_id,
+                start_time=float(self.env.now),
+                end_time=float(self.env.now) + travel_time_s,
+                from_location=from_loc,
+                to_location=target_stop_id,
+                distance_m=distance_m,
+                associated_bus_id=None,
+                movement_type="independent"
+            )
 
-                # Update MAP state
-                map_state.current_location = target_location
-                map_state.assigned_bus_id = bus_id
-                map_state.arrival_time_at_target_s = float(self.env.now)
-                map_state.distance_traveled_m += distance_m
+        # Deduct travel energy from MAP battery
+        travel_energy = distance_m * MAP_ENERGY_PER_METER_WH
+        state.current_soc_wh = max(0.0, state.current_soc_wh - travel_energy)
 
-                # Record movement
-                if self.map_tracker:
-                    self.map_tracker.record_movement(
-                        map_id=map_id,
-                        start_time=float(self.env.now) - travel_time_s,
-                        end_time=float(self.env.now),
-                        from_location=map_state.current_location,
-                        to_location=target_location,
-                        distance_m=distance_m,
-                        associated_bus_id=bus_id
-                    )
+        state.current_location = target_stop_id
+        if target_lat is not None:
+            state.current_lat = target_lat
+        if target_lon is not None:
+            state.current_lon = target_lon
+        state.distance_traveled_m += distance_m
+        state.arrival_time_at_target_s = float(self.env.now) + travel_time_s
+        self.record_map_soc(map_id, float(self.env.now) + travel_time_s)
+        return (travel_time_s, distance_m)
 
-            self.env.process(move_process())
-            return (travel_time_s, distance_m)
-        else:
-            # Already at location
-            map_state.current_location = target_location
-            map_state.assigned_bus_id = bus_id
-            map_state.arrival_time_at_target_s = float(self.env.now)
-            return (0.0, distance_m)
+    def start_following(self, map_id: int, bus_id: str):
+        """Mark a MAP as attached to a bus and following it"""
+        state = self.map_states.get(map_id)
+        if state:
+            # Cancel any running self-recharge before the MAP starts working
+            if state.is_recharging:
+                proc = self.map_recharge_processes.get(map_id)
+                if proc is not None and proc.is_alive:
+                    try:
+                        proc.interrupt()
+                    except RuntimeError:
+                        pass
+                state.is_recharging = False
+            state.is_following_bus = True
+            state.assigned_bus_id = bus_id
+            state.is_charging = True
 
-    def get_map_location(self, map_id: int) -> str:
+    def stop_following(self, map_id: int):
+        """Detach a MAP from its bus; MAP becomes available again and self-recharges if needed"""
+        state = self.map_states.get(map_id)
+        if state:
+            state.is_following_bus = False
+            state.assigned_bus_id = None
+            state.is_charging = False
+            self._schedule_recharge(map_id)
+
+    def update_location_following_bus(self, map_id: int, stop_id: str,
+                                      lat: Optional[float] = None,
+                                      lon: Optional[float] = None):
+        """Sync MAP location with bus after each segment when following"""
+        state = self.map_states.get(map_id)
+        if state is None:
+            return
+        from_loc = state.current_location
+        if from_loc != stop_id:
+            distance_m, _ = self.calculate_travel_time(from_loc, stop_id) if from_loc else (0.0, 0.0)
+            if self.map_tracker:
+                self.map_tracker.record_movement(
+                    map_id=map_id,
+                    start_time=float(self.env.now),
+                    end_time=float(self.env.now),
+                    from_location=from_loc or "unknown",
+                    to_location=stop_id,
+                    distance_m=distance_m,
+                    associated_bus_id=state.assigned_bus_id,
+                    movement_type="following_bus"
+                )
+            # Deduct travel energy from MAP battery
+            travel_energy = distance_m * MAP_ENERGY_PER_METER_WH
+            state.current_soc_wh = max(0.0, state.current_soc_wh - travel_energy)
+            state.current_location = stop_id
+            state.distance_traveled_m += distance_m
+            self.record_map_soc(map_id, float(self.env.now))
+        if lat is not None:
+            state.current_lat = lat
+        if lon is not None:
+            state.current_lon = lon
+
+    def _schedule_recharge(self, map_id: int):
+        """Start a self-recharge SimPy process for a MAP if its battery is not full."""
+        state = self.map_states.get(map_id)
+        if state is None or state.current_soc_wh >= state.battery_capacity_wh:
+            return
+        # Don't start a new process if one is already running
+        proc = self.map_recharge_processes.get(map_id)
+        if proc is not None and proc.is_alive:
+            return
+        # Set is_recharging synchronously so it takes effect immediately
+        state.is_recharging = True
+        self.record_map_soc(map_id, float(self.env.now))
+        process = self.env.process(self._recharge_map_process(map_id))
+        self.map_recharge_processes[map_id] = process
+
+    def _recharge_map_process(self, map_id: int):
+        """SimPy generator: self-recharge a MAP at MAP_RECHARGE_RATE_WH_S until full."""
+        state = self.map_states[map_id]
+        try:
+            while state.current_soc_wh < state.battery_capacity_wh:
+                energy_needed = state.battery_capacity_wh - state.current_soc_wh
+                time_to_full = energy_needed / MAP_RECHARGE_RATE_WH_S
+                yield self.env.timeout(time_to_full)
+                state.current_soc_wh = state.battery_capacity_wh
+        except simpy.Interrupt:
+            pass
+        finally:
+            state.is_recharging = False
+            self.map_recharge_processes.pop(map_id, None)
+            self.record_map_soc(map_id, float(self.env.now))
+
+    def get_available_map(self, current_stop_id: Optional[str] = None,
+                          current_lat: Optional[float] = None,
+                          current_lon: Optional[float] = None) -> Optional[int]:
+        """Return best available MAP: unspawned preferred, then nearest idle spawned.
+
+        A MAP is considered unavailable if it is following a bus, self-recharging,
+        or its usable SOC (above the 10 % floor) is exhausted.
+
+        Returns map_id or None if no MAP is available.
+        """
+        def _has_usable_energy(state: MAPState) -> bool:
+            return state.current_soc_wh > MAP_MIN_SOC * state.battery_capacity_wh
+
+        # Prefer unspawned (spawns at target for free), but only if it has energy
+        for map_id, state in self.map_states.items():
+            if not state.spawned and _has_usable_energy(state):
+                return map_id
+
+        # Then nearest idle spawned MAP (not following, not recharging, has usable energy)
+        best_map = None
+        best_dist = float('inf')
+        for map_id, state in self.map_states.items():
+            if state.is_following_bus or state.is_charging or state.is_recharging:
+                continue
+            if not _has_usable_energy(state):
+                continue
+            if current_stop_id and state.current_location:
+                dist, _ = self.calculate_travel_time(state.current_location, current_stop_id)
+            else:
+                dist = 0.0
+            if dist < best_dist:
+                best_dist = dist
+                best_map = map_id
+        return best_map
+
+    def get_following_map_for_bus(self, bus_id: str) -> Optional[int]:
+        """Return the MAP currently following the given bus, or None"""
+        for map_id, state in self.map_states.items():
+            if state.is_following_bus and state.assigned_bus_id == bus_id:
+                return map_id
+        return None
+
+    def get_map_location(self, map_id: int) -> Optional[str]:
         """Get current location of a MAP"""
         if map_id in self.map_states:
             return self.map_states[map_id].current_location
@@ -896,13 +804,6 @@ class MAPMovementScheduler:
             return self.map_states[map_id].current_soc_wh
         return 0.0
 
-    def update_map_soc(self, map_id: int, energy_consumed_wh: float):
-        """Update MAP SOC after charging a bus"""
-        if map_id in self.map_states:
-            state = self.map_states[map_id]
-            state.current_soc_wh = max(0.0, state.current_soc_wh - energy_consumed_wh)
-            state.num_charging_events += 1
-
     def map_is_at_location(self, map_id: int, location: str) -> bool:
         """Check if a MAP is at a specific location"""
         if map_id in self.map_states:
@@ -913,9 +814,16 @@ class MAPMovementScheduler:
         """Get summary of MAP states"""
         summary = {}
         for map_id, state in self.map_states.items():
+            soc_pct = (state.current_soc_wh / state.battery_capacity_wh * 100.0
+                       if state.battery_capacity_wh > 0 else 0.0)
             summary[map_id] = {
                 'current_location': state.current_location,
+                'spawned': state.spawned,
+                'is_following_bus': state.is_following_bus,
+                'is_recharging': state.is_recharging,
                 'current_soc_wh': state.current_soc_wh,
+                'battery_capacity_wh': state.battery_capacity_wh,
+                'current_soc_pct': soc_pct,
                 'distance_traveled_m': state.distance_traveled_m,
                 'num_charging_events': state.num_charging_events,
                 'assigned_bus': state.assigned_bus_id
@@ -945,6 +853,656 @@ class LayoverRecord:
     was_preempted: bool = False
 
 # ========================
+# CHARGING STRATEGY OPTIMIZER
+# ========================
+
+class ChargingStrategyOptimizer:
+    """Offline optimizer that analyses bus routes and energy profiles to recommend
+    the best MAP charging strategy for each bus.
+
+    For every bus it simulates the route without any charging to locate critical
+    events (SOC < 20 %).  It then tests whether terminal-only charging keeps all
+    buses above the floor; if not it prescribes en-route or hybrid charging.
+    The class also estimates the minimum number of MAPs required to serve the
+    fleet's total energy demand while respecting each MAP's 10 % SOC reserve.
+
+    Charging methods
+    ----------------
+    ``none``      – bus never drops below 20 %; no MAP needed
+    ``terminal``  – terminal-layover charging alone is sufficient
+    ``en_route``  – no usable terminal; MAP must follow bus between stops
+    ``hybrid``    – terminal charging helps but en-route top-ups are also needed
+    """
+
+    def __init__(self, sim, bus_trips_dict: Dict[str, List[str]],
+                 battery_capacity_wh: float,
+                 num_maps: int,
+                 map_battery_capacity_wh: float = MAP_BATTERY_CAPACITY_WH,
+                 map_charging_rate_wh_s: float = MAP_CHARGING_RATE_WH_S,
+                 trip_change_stops: Optional[set] = None):
+
+        self.sim = sim
+        self.bus_trips_dict = bus_trips_dict
+        self.battery_capacity_wh = battery_capacity_wh
+        self.num_maps = num_maps
+        self.map_battery_capacity_wh = map_battery_capacity_wh
+        self.map_charging_rate_wh_s = map_charging_rate_wh_s
+        self.trip_change_stops = trip_change_stops or set()
+
+        self.bus_charging_plans: Dict[str, Dict] = {}
+        self.system_summary: Dict = {}
+
+        self._analyze()
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _sorted_trip_ids(self, trip_ids: List[str]) -> List[str]:
+        """Return trip_ids sorted by start time."""
+        def _start(tid):
+            try:
+                seq = self.sim.gtfs.stop_sequence(tid)
+                return seq[0]["arrival"] if seq else float('inf')
+            except Exception:
+                return float('inf')
+        return sorted(trip_ids, key=_start)
+
+    def _simulate_no_charging(self, trip_ids: List[str]) -> List[Dict]:
+        """Drive the bus over its full schedule with no charging.
+
+        Returns a list of per-segment event dicts with keys:
+          trip_id, stop_id, time_s, soc_wh, energy_wh, dist_m
+        """
+        soc = self.battery_capacity_wh
+        events: List[Dict] = []
+
+        for trip_id in self._sorted_trip_ids(trip_ids):
+            try:
+                seq = self.sim.gtfs.stop_sequence(trip_id)
+            except Exception:
+                continue
+            if not seq or len(seq) < 2:
+                continue
+
+            for i in range(1, len(seq)):
+                prev, curr = seq[i - 1], seq[i]
+                try:
+                    _, _, dist = self.sim.geod.inv(
+                        prev["lon"], prev["lat"], curr["lon"], curr["lat"])
+                    dist = abs(dist)
+                except Exception:
+                    dist = 0.0
+
+                energy = dist * ENERGY_PER_METER_WH
+                soc = max(0.0, soc - energy)
+                dt = max(0.0, curr["arrival"] - prev["arrival"])
+
+                events.append({
+                    "trip_id": trip_id,
+                    "stop_id": curr.get("stop_id"),
+                    "time_s": curr["arrival"],
+                    "soc_wh": soc,
+                    "energy_wh": energy,
+                    "dist_m": dist,
+                    "dt_s": dt,
+                })
+        return events
+
+    def _terminal_layovers(self, trip_ids: List[str]) -> List[Dict]:
+        """Return all terminal layover opportunities for a bus schedule."""
+        layovers: List[Dict] = []
+        sorted_ids = self._sorted_trip_ids(trip_ids)
+
+        prev_end_time = None
+        prev_end_node = None
+
+        for trip_id in sorted_ids:
+            try:
+                seq = self.sim.gtfs.stop_sequence(trip_id)
+            except Exception:
+                continue
+            if not seq:
+                continue
+
+            start_stop = seq[0].get("stop_id")
+            trip_start = seq[0]["arrival"]
+            start_node = self.sim.stop_node.get(start_stop)
+
+            if (prev_end_time is not None
+                    and prev_end_node is not None
+                    and start_node is not None
+                    and prev_end_node == start_node
+                    and start_stop in self.trip_change_stops):
+                duration = trip_start - prev_end_time
+                if duration > 0:
+                    layovers.append({
+                        "stop_id": start_stop,
+                        "time_s": trip_start,
+                        "duration_s": duration,
+                    })
+
+            prev_end_time = seq[-1]["arrival"]
+            prev_end_node = self.sim.stop_node.get(seq[-1].get("stop_id"))
+
+        return layovers
+
+    def _replay_terminal_only(self, events: List[Dict],
+                               layovers: List[Dict]) -> Dict:
+        """Replay bus energy with terminal charging only.
+
+        Returns dict with keys: feasible, total_charged_wh, min_soc_pct,
+        charge_events.
+        """
+        soc = self.battery_capacity_wh
+        total_charged = 0.0
+        charge_events: List[Dict] = []
+        min_soc = soc
+
+        sorted_layovers = sorted(layovers, key=lambda x: x["time_s"])
+        layover_idx = 0
+        # Max energy a MAP can deliver per session (90 % of its battery)
+        map_usable = self.map_battery_capacity_wh * (1.0 - MAP_MIN_SOC)
+
+        for ev in events:
+            soc = max(0.0, soc - ev["energy_wh"])
+
+            # Apply terminal charge if we just reached a layover point
+            while layover_idx < len(sorted_layovers):
+                lov = sorted_layovers[layover_idx]
+                if ev["time_s"] < lov["time_s"]:
+                    break
+                target = BUS_CHARGE_CUTOFF_SOC * self.battery_capacity_wh
+                max_energy_by_duration = self.map_charging_rate_wh_s * lov["duration_s"]
+                charge = min(max(0.0, target - soc), max_energy_by_duration, map_usable)
+                soc = min(self.battery_capacity_wh, soc + charge)
+                if charge > 0:
+                    charge_events.append({"stop_id": lov["stop_id"],
+                                          "time_s": lov["time_s"],
+                                          "energy_wh": charge})
+                    total_charged += charge
+                layover_idx += 1
+
+            min_soc = min(min_soc, soc)
+
+        return {
+            "feasible": min_soc >= BUS_MIN_SOC * self.battery_capacity_wh,
+            "total_charged_wh": total_charged,
+            "min_soc_pct": min_soc / self.battery_capacity_wh,
+            "charge_events": charge_events,
+        }
+
+    def _replay_hybrid(self, events: List[Dict],
+                        layovers: List[Dict]) -> Dict:
+        """Replay bus energy with terminal + en-route segment charging.
+
+        Returns dict with keys: feasible, total_charged_wh, min_soc_pct,
+        terminal_events, enroute_events.
+        """
+        soc = self.battery_capacity_wh
+        total_charged = 0.0
+        terminal_events: List[Dict] = []
+        enroute_events: List[Dict] = []
+        min_soc = soc
+
+        sorted_layovers = sorted(layovers, key=lambda x: x["time_s"])
+        layover_idx = 0
+        map_usable = self.map_battery_capacity_wh * (1.0 - MAP_MIN_SOC)
+
+        for ev in events:
+            soc = max(0.0, soc - ev["energy_wh"])
+
+            # Terminal charge if layover reached
+            while layover_idx < len(sorted_layovers):
+                lov = sorted_layovers[layover_idx]
+                if ev["time_s"] < lov["time_s"]:
+                    break
+                target = BUS_CHARGE_CUTOFF_SOC * self.battery_capacity_wh
+                max_energy_by_duration = self.map_charging_rate_wh_s * lov["duration_s"]
+                charge = min(max(0.0, target - soc), max_energy_by_duration, map_usable)
+                soc = min(self.battery_capacity_wh, soc + charge)
+                if charge > 0:
+                    terminal_events.append({"stop_id": lov["stop_id"],
+                                            "time_s": lov["time_s"],
+                                            "energy_wh": charge})
+                    total_charged += charge
+                layover_idx += 1
+
+            # En-route top-up when below threshold
+            if soc < BUS_CHARGE_THRESHOLD_SOC * self.battery_capacity_wh:
+                target = BUS_CHARGE_CUTOFF_SOC * self.battery_capacity_wh
+                max_energy_by_segment = self.map_charging_rate_wh_s * ev["dt_s"]
+                charge = min(max(0.0, target - soc), max_energy_by_segment, map_usable)
+                soc = min(self.battery_capacity_wh, soc + charge)
+                if charge > 0:
+                    enroute_events.append({"stop_id": ev["stop_id"],
+                                           "time_s": ev["time_s"],
+                                           "energy_wh": charge})
+                    total_charged += charge
+
+            min_soc = min(min_soc, soc)
+
+        return {
+            "feasible": min_soc >= BUS_MIN_SOC * self.battery_capacity_wh,
+            "total_charged_wh": total_charged,
+            "min_soc_pct": min_soc / self.battery_capacity_wh,
+            "terminal_events": terminal_events,
+            "enroute_events": enroute_events,
+        }
+
+    def _analyze_bus(self, bus_id: str, trip_ids: List[str]) -> Dict:
+        """Produce a charging plan for one bus."""
+        events = self._simulate_no_charging(trip_ids)
+        layovers = self._terminal_layovers(trip_ids)
+
+        min_soc_pct_bare = (
+            min((e["soc_wh"] for e in events), default=self.battery_capacity_wh)
+            / self.battery_capacity_wh
+        )
+
+        # No charge needed
+        if min_soc_pct_bare >= BUS_MIN_SOC:
+            return {"method": "none", "total_energy_needed_wh": 0.0,
+                    "min_soc_pct_bare": min_soc_pct_bare}
+
+        # Try terminal only
+        t_plan = self._replay_terminal_only(events, layovers)
+        if t_plan["feasible"]:
+            return {"method": "terminal",
+                    "total_energy_needed_wh": t_plan["total_charged_wh"],
+                    "min_soc_pct_bare": min_soc_pct_bare,
+                    "min_soc_pct_with_charging": t_plan["min_soc_pct"],
+                    "terminal_events": t_plan["charge_events"]}
+
+        # Need en-route / hybrid
+        h_plan = self._replay_hybrid(events, layovers)
+        method = "hybrid" if h_plan["terminal_events"] else "en_route"
+        return {"method": method,
+                "total_energy_needed_wh": h_plan["total_charged_wh"],
+                "min_soc_pct_bare": min_soc_pct_bare,
+                "min_soc_pct_with_charging": h_plan["min_soc_pct"],
+                "terminal_events": h_plan.get("terminal_events", []),
+                "enroute_events": h_plan.get("enroute_events", [])}
+
+    def _analyze(self):
+        """Analyse all buses and build system summary."""
+        method_counts: Dict[str, int] = defaultdict(int)
+        total_energy = 0.0
+
+        for bus_id, trip_ids in self.bus_trips_dict.items():
+            plan = self._analyze_bus(bus_id, trip_ids)
+            self.bus_charging_plans[bus_id] = plan
+            method_counts[plan["method"]] += 1
+            total_energy += plan.get("total_energy_needed_wh", 0.0)
+
+        # Minimum MAP count: total demand / usable MAP capacity (90 %)
+        usable = self.map_battery_capacity_wh * (1.0 - MAP_MIN_SOC)
+        recommended_maps = max(1, int(np.ceil(total_energy / usable))) if total_energy > 0 else 0
+
+        buses_needing = sum(1 for p in self.bus_charging_plans.values()
+                            if p["method"] != "none")
+        self.system_summary = {
+            "total_buses": len(self.bus_charging_plans),
+            "buses_needing_charge": buses_needing,
+            "method_distribution": dict(method_counts),
+            "total_energy_needed_wh": total_energy,
+            "recommended_num_maps": recommended_maps,
+            "current_num_maps": self.num_maps,
+            "map_count_sufficient": self.num_maps >= recommended_maps,
+        }
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def get_recommended_method(self, bus_id: str) -> str:
+        """Return the recommended charging method for *bus_id*."""
+        return self.bus_charging_plans.get(bus_id, {}).get("method", "terminal")
+
+    def print_summary(self):
+        """Print the optimization summary report."""
+        print("\n" + "=" * 70)
+        print("CHARGING STRATEGY OPTIMIZATION REPORT")
+        print("=" * 70)
+
+        s = self.system_summary
+        print(f"\nSystem Overview:")
+        print(f"  Total buses analyzed:    {s['total_buses']}")
+        print(f"  Buses needing charge:    {s['buses_needing_charge']}")
+        print(f"  Total energy demand:     {s['total_energy_needed_wh'] / 1e6:,.3f} MWh")
+
+        print(f"\nRecommended Charging Method per Bus:")
+        for method, count in sorted(s["method_distribution"].items()):
+            pct = 100.0 * count / max(1, s["total_buses"])
+            print(f"  {method:<12}: {count:>4} buses  ({pct:.0f} %)")
+
+        print(f"\nMAP Fleet Assessment:")
+        print(f"  Configured MAPs:         {s['current_num_maps']}")
+        print(f"  Minimum MAPs needed:     {s['recommended_num_maps']}")
+        if s["map_count_sufficient"]:
+            print(f"  ✓ Configured fleet is sufficient")
+        else:
+            deficit = s["recommended_num_maps"] - s["current_num_maps"]
+            print(f"  ✗ Need {deficit} more MAP(s) to cover total energy demand")
+
+        for label, key in [("hybrid", "hybrid"), ("en_route", "en_route")]:
+            buses = [b for b, p in self.bus_charging_plans.items()
+                     if p["method"] == key]
+            if buses:
+                print(f"\nBuses requiring '{key}' charging (first 5):")
+                for b in buses[:5]:
+                    p = self.bus_charging_plans[b]
+                    print(f"  {b:<20}  bare_min={p['min_soc_pct_bare']*100:.1f}%  "
+                          f"need={p['total_energy_needed_wh']/1000:.1f} kWh")
+                if len(buses) > 5:
+                    print(f"  … and {len(buses) - 5} more")
+
+        print(f"\n{'=' * 70}\n")
+
+    def compare_with_baseline(self, baseline_results: Dict) -> Dict:
+        """Compare offline optimal plans against a baseline simulation run.
+
+        Parameters
+        ----------
+        baseline_results : dict returned by
+            :meth:`BaselineTerminalChargingSimulation._collect_statistics`
+
+        Returns a comparison dict and prints a human-readable report.
+        """
+        bus_stats = baseline_results.get("bus_statistics", {})
+
+        baseline_feasible = baseline_results.get("feasible", False)
+        baseline_min_soc = baseline_results.get("min_soc_overall_ratio", 0.0)
+        baseline_total_charged = baseline_results.get("total_energy_charged_wh", 0.0)
+        buses_below_floor = set(baseline_results.get("buses_below_floor", []))
+
+        # Offline optimal — use the plans already computed by _analyze()
+        opt_methods = self.system_summary.get("method_distribution", {})
+        opt_total_energy = self.system_summary.get("total_energy_needed_wh", 0.0)
+        buses_needing_enroute = [
+            b for b, p in self.bus_charging_plans.items()
+            if p.get("method") in {"en_route", "hybrid"}
+        ]
+
+        # Improvement flag: dynamic strategy is "better" if baseline is
+        # infeasible OR if it would reduce total MAP travel (en-route means
+        # MAP follows bus, so MAP distance is equal to bus distance for those
+        # segments — the optimizer already accounts for this via method choice)
+        improvement_possible = (
+            not baseline_feasible or len(buses_needing_enroute) > 0
+        )
+
+        comparison = {
+            "baseline_feasible": baseline_feasible,
+            "baseline_min_soc_pct": baseline_min_soc * 100.0,
+            "baseline_total_charged_wh": baseline_total_charged,
+            "baseline_buses_below_floor": list(buses_below_floor),
+            "opt_method_distribution": opt_methods,
+            "opt_total_energy_needed_wh": opt_total_energy,
+            "buses_needing_enroute_charging": buses_needing_enroute,
+            "dynamic_strategy_improves": improvement_possible,
+        }
+
+        # Print report
+        print("\n" + "=" * 70)
+        print("POST-SIMULATION STRATEGY COMPARISON")
+        print("  Baseline (stationary MAPs) vs Offline Optimal")
+        print("=" * 70)
+
+        print(f"\nBASELINE RESULTS:")
+        print(f"  Feasible:              {'✓ YES' if baseline_feasible else '✗ NO'}")
+        print(f"  Min bus SOC:           {baseline_min_soc*100:.1f}%")
+        print(f"  Total energy charged:  {baseline_total_charged/1e6:,.3f} MWh")
+        if buses_below_floor:
+            print(f"  Buses below 20% floor: {len(buses_below_floor)}")
+
+        print(f"\nOFFLINE OPTIMAL (ChargingStrategyOptimizer):")
+        print(f"  Total energy demand:   {opt_total_energy/1e6:,.3f} MWh")
+        print(f"  Method breakdown:")
+        for method, count in sorted(opt_methods.items()):
+            pct = 100.0 * count / max(1, self.system_summary["total_buses"])
+            print(f"    {method:<12}: {count:>4} buses  ({pct:.0f}%)")
+
+        if buses_needing_enroute:
+            print(f"\n  Buses that CANNOT be served by terminal-only charging:")
+            for b in buses_needing_enroute[:10]:
+                p = self.bus_charging_plans[b]
+                bl_min = bus_stats.get(b, {}).get("min_soc_ratio", 1.0)
+                print(f"    {b:<22} baseline_min={bl_min*100:.1f}%  "
+                      f"method={p['method']}  "
+                      f"need={p.get('total_energy_needed_wh', 0)/1000:.1f} kWh")
+            if len(buses_needing_enroute) > 10:
+                print(f"    … and {len(buses_needing_enroute) - 10} more")
+
+        print(f"\nRECOMMENDATION:")
+        if not improvement_possible:
+            print(f"  ✓ Baseline strategy is SUFFICIENT.")
+            print(f"    All buses stay above {BUS_MIN_SOC*100:.0f}% SOC with terminal-only charging.")
+            print(f"    No en-route or hybrid charging is needed.")
+        else:
+            if not baseline_feasible:
+                print(f"  ✗ Baseline is INFEASIBLE — some buses fell below "
+                      f"{BUS_MIN_SOC*100:.0f}% SOC.")
+            if buses_needing_enroute:
+                print(f"  ⚡ Dynamic strategy (en-route / hybrid) is RECOMMENDED.")
+                print(f"    {len(buses_needing_enroute)} bus(es) require charging "
+                      f"beyond what terminals alone can supply.")
+                print(f"    Use run_terminal_charging_simulation() with the same "
+                      f"num_maps to enable en-route charging.")
+
+        print("=" * 70 + "\n")
+        return comparison
+
+
+# ========================
+# DEPOT PLACEMENT OPTIMIZER
+# ========================
+
+class DepotPlacementOptimizer:
+    """Post-simulation optimizer that clusters MAP deployment locations to
+    identify where physical depots (fast-charging stations for MAPs) should
+    be placed and how many are required.
+
+    Algorithm
+    ---------
+    1. Collect every stop where a MAP delivered energy to a bus.
+    2. Weight each stop by total energy delivered there.
+    3. Run weighted k-means to find *k* cluster centroids.
+    4. Map each centroid to the nearest real bus stop (the depot site).
+    5. Recommend *k* based on: max(1, min(num_maps, ceil(sqrt(active_stops)))).
+    """
+
+    def __init__(self, map_tracker: MAPUsageTracker,
+                 map_movement_scheduler: "MAPMovementScheduler",
+                 num_maps: int,
+                 map_battery_capacity_wh: float = MAP_BATTERY_CAPACITY_WH):
+
+        self.map_tracker = map_tracker
+        self.scheduler = map_movement_scheduler
+        self.num_maps = num_maps
+        self.map_battery_capacity_wh = map_battery_capacity_wh
+
+        self.depot_locations: List[Dict] = []
+        self.num_depots_recommended: int = 0
+        self.analysis: Dict = {}
+
+        self._analyze()
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _deployment_weights(self) -> Dict[str, float]:
+        """Return {stop_id: total_energy_delivered_wh} across all charging records."""
+        weights: Dict[str, float] = defaultdict(float)
+        for rec in self.map_tracker.charging_records:
+            loc = rec.location
+            stop_id = loc[5:] if loc.startswith("stop_") else loc
+            weights[stop_id] += rec.energy_delivered_wh
+        return dict(weights)
+
+    def _stop_coords(self) -> Dict[str, Tuple[float, float]]:
+        """Return the stop-coordinate dict from the scheduler."""
+        return self.scheduler.stop_locations  # {stop_id: (lat, lon)}
+
+    def _weighted_kmeans(self, weights: Dict[str, float],
+                          coords: Dict[str, Tuple[float, float]],
+                          k: int) -> List[Dict]:
+        """Run weighted k-means; return list of depot dicts."""
+        valid = {sid: w for sid, w in weights.items() if sid in coords}
+        if not valid or k <= 0:
+            return []
+
+        stop_ids = list(valid.keys())
+        w_arr = np.array([valid[s] for s in stop_ids], dtype=float)
+        lats = np.array([coords[s][0] for s in stop_ids], dtype=float)
+        lons = np.array([coords[s][1] for s in stop_ids], dtype=float)
+
+        n = min(k, len(stop_ids))
+        rng = np.random.RandomState(0)
+        prob = w_arr / w_arr.sum()
+        centroid_indices = rng.choice(len(stop_ids), size=n, replace=False, p=prob)
+        c_lats, c_lons = lats[centroid_indices].copy(), lons[centroid_indices].copy()
+
+        for _ in range(200):
+            # Assign stops to nearest centroid
+            dx = lats[:, None] - c_lats[None, :]
+            dy = lons[:, None] - c_lons[None, :]
+            assign = np.argmin(dx ** 2 + dy ** 2, axis=1)
+
+            new_lats, new_lons = c_lats.copy(), c_lons.copy()
+            for cluster_idx in range(n):
+                mask = assign == cluster_idx
+                if mask.sum() > 0:
+                    new_lats[cluster_idx] = np.average(lats[mask], weights=w_arr[mask])
+                    new_lons[cluster_idx] = np.average(lons[mask], weights=w_arr[mask])
+
+            if np.allclose(c_lats, new_lats) and np.allclose(c_lons, new_lons):
+                break
+            c_lats, c_lons = new_lats, new_lons
+
+        # Map each centroid to the nearest real stop
+        results = []
+        for cluster_idx in range(n):
+            mask = assign == cluster_idx
+            cluster_w = w_arr[mask].sum() if mask.sum() > 0 else 0.0
+            dx = lats - c_lats[cluster_idx]
+            dy = lons - c_lons[cluster_idx]
+            nearest = stop_ids[int(np.argmin(dx ** 2 + dy ** 2))]
+            results.append({
+                "depot_id": cluster_idx,
+                "centroid_lat": float(c_lats[cluster_idx]),
+                "centroid_lon": float(c_lons[cluster_idx]),
+                "nearest_stop_id": nearest,
+                "total_weight_wh": float(cluster_w),
+                "num_stops_in_cluster": int(mask.sum()),
+            })
+
+        results.sort(key=lambda x: x["total_weight_wh"], reverse=True)
+        return results
+
+    def _analyze(self):
+        weights = self._deployment_weights()
+        coords = self._stop_coords()
+
+        if not weights:
+            self.analysis = {"status": "no_data",
+                             "message": "No MAP deployment data available."}
+            return
+
+        total_e = sum(weights.values())
+        n_active = len(weights)
+        k = max(1, min(self.num_maps, int(np.ceil(np.sqrt(n_active)))))
+
+        self.num_depots_recommended = k
+        self.depot_locations = self._weighted_kmeans(weights, coords, k)
+
+        self.analysis = {
+            "status": "ok",
+            "num_active_stops": n_active,
+            "total_energy_wh": total_e,
+            "num_depots": k,
+            "depots": self.depot_locations,
+        }
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def print_summary(self):
+        """Print depot placement recommendations."""
+        print("\n" + "=" * 70)
+        print("OPTIMAL MAP DEPOT PLACEMENT ANALYSIS")
+        print("=" * 70)
+
+        if self.analysis.get("status") != "ok":
+            print(f"\n  {self.analysis.get('message', 'No data.')}\n")
+            return
+
+        a = self.analysis
+        print(f"\nDeployment Statistics:")
+        print(f"  Active stops (energy delivered):  {a['num_active_stops']}")
+        print(f"  Total energy delivered:           {a['total_energy_wh']/1e6:,.3f} MWh")
+        print(f"\nRecommended number of depots: {self.num_depots_recommended}")
+        print("-" * 70)
+        print(f"{'Depot':<8} {'Nearest Stop':<16} {'Lat':>10} {'Lon':>11}"
+              f"  {'Energy (kWh)':>14}  {'Cluster Stops':>13}")
+        print("-" * 70)
+        for d in self.depot_locations:
+            print(f"{d['depot_id']:<8} {d['nearest_stop_id']:<16}"
+                  f" {d['centroid_lat']:>10.5f} {d['centroid_lon']:>11.5f}"
+                  f"  {d['total_weight_wh']/1000:>14,.1f}"
+                  f"  {d['num_stops_in_cluster']:>13}")
+        print(f"\nNote: Each depot is a fast-charging station for idle MAPs,")
+        print(f"      reducing MAP idle time and extending fleet availability.\n")
+        print("=" * 70 + "\n")
+
+    def plot_depot_map(self, save_path: str = "depot_placement.png"):
+        """Scatter-plot deployment stops (colour = energy) and depot stars."""
+        weights = self._deployment_weights()
+        coords = self._stop_coords()
+
+        fig, ax = plt.subplots(figsize=(12, 9))
+
+        if weights and coords:
+            s_lats, s_lons, s_w = [], [], []
+            for sid, w in weights.items():
+                if sid in coords:
+                    s_lats.append(coords[sid][0])
+                    s_lons.append(coords[sid][1])
+                    s_w.append(w)
+            if s_lats:
+                sc = ax.scatter(s_lons, s_lats, c=s_w, cmap="YlOrRd",
+                                s=40, alpha=0.65, zorder=2,
+                                label="Deployment stops")
+                plt.colorbar(sc, ax=ax, label="Energy delivered (Wh)")
+
+        for d in self.depot_locations:
+            ax.scatter(d["centroid_lon"], d["centroid_lat"],
+                       marker="*", color="blue", s=350, zorder=5,
+                       label="Depot" if d["depot_id"] == 0 else None)
+            ax.annotate(
+                f"Depot {d['depot_id']}\n({d['nearest_stop_id']})",
+                (d["centroid_lon"], d["centroid_lat"]),
+                textcoords="offset points", xytext=(8, 5),
+                fontsize=8, color="blue",
+                bbox=dict(boxstyle="round,pad=0.2", facecolor="white", alpha=0.75),
+            )
+
+        ax.set_xlabel("Longitude", fontweight="bold")
+        ax.set_ylabel("Latitude", fontweight="bold")
+        ax.set_title(
+            f"Optimal MAP Depot Placement  ({self.num_depots_recommended} depots)",
+            fontweight="bold",
+        )
+        ax.legend(loc="best")
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=300, bbox_inches="tight")
+        print(f"Depot placement map saved to: {save_path}")
+        plt.close()
+
+# ========================
 # STAGE 2: DES SIMULATION
 # ========================
 
@@ -956,7 +1514,8 @@ class Stage2DESTerminalChargingPreemptive:
                  initial_battery_capacity_wh: float = 250000,
                  num_maps: int = 1,
                  optimize_threshold: bool = True,
-                 preemption_threshold: Optional[float] = None):
+                 preemption_threshold: Optional[float] = None,
+                 map_battery_capacity_wh: Optional[Union[float, List[float]]] = None):
 
         self.sim = sim
         self.bus_trips_dict = bus_trips_dict
@@ -997,7 +1556,7 @@ class Stage2DESTerminalChargingPreemptive:
         self.map_movement_scheduler = MAPMovementScheduler(
             self.env,
             num_maps=num_maps,
-            map_battery_capacity_wh=initial_battery_capacity_wh,
+            map_battery_capacity_wh=map_battery_capacity_wh,
             map_speed_ms=CHARGER_SPEED_MS,
             map_tracker=self.map_tracker
         )
@@ -1022,31 +1581,110 @@ class Stage2DESTerminalChargingPreemptive:
         self.layovers = []
         self.bus_soc_history = defaultdict(list)
 
-        policy = ChargingPolicy(start_pct=0.7, stop_pct=0.8, rate_wh_per_s=97.22)
-        self.stop_charging_manager = PreemptiveStopChargingManager(
-            self.env,
-            capacity_per_stop=1,
-            policy=policy,
-            on_charge=self._on_charge,
-            preemption_threshold=self.preemption_threshold,
-            num_maps=num_maps,
-            map_tracker=self.map_tracker
-        )
-
         self.bus_soc = defaultdict(float)
         self.bus_energy_charged = defaultdict(float)
 
-    def _on_charge(self, bus_id: str, amount_wh: float, duration_s: float):
-        """Callback when charging starts"""
-        try:
-            cap = self.battery_capacity_wh
-            prev = self.bus_soc.get(bus_id, float(cap))
-            new = min(float(cap), prev + amount_wh)
-            self.bus_soc[bus_id] = new
-            self.bus_energy_charged[bus_id] += amount_wh
-            self.bus_soc_history[bus_id].append((float(self.env.now), new))
-        except Exception:
-            pass
+    def _terminal_charge(self, bus_id: str, stop_id: str, layover_duration_s: float,
+                         capacity: float):
+        """Handle terminal charging as a SimPy sub-process (generator).
+
+        Called with ``yield from`` inside ``_simulate_bus``.  The generator
+        yields SimPy timeouts so the simulated clock advances appropriately.
+        MAPs that are already following persist through the layover.
+        """
+        if self.num_maps <= 0:
+            return
+
+        soc = self.bus_soc.get(bus_id, capacity)
+        target_wh = BUS_CHARGE_CUTOFF_SOC * capacity
+
+        # --- Case 1: a MAP is already following this bus ---
+        following_map = self.map_movement_scheduler.get_following_map_for_bus(bus_id)
+        if following_map is not None:
+            map_state = self.map_movement_scheduler.map_states[following_map]
+            map_floor = MAP_MIN_SOC * map_state.battery_capacity_wh
+            # Release MAP if bus is already charged or MAP has no usable energy to give
+            if soc >= target_wh or map_state.current_soc_wh <= map_floor:
+                self.map_movement_scheduler.stop_following(following_map)
+                return
+            # Limit energy to what the MAP can give above its 10 % floor
+            available_map_energy = map_state.current_soc_wh - map_floor
+            t_start = float(self.env.now)
+            energy = min(MAP_CHARGING_RATE_WH_S * layover_duration_s,
+                         target_wh - soc,
+                         available_map_energy)
+            charge_dur = energy / MAP_CHARGING_RATE_WH_S if MAP_CHARGING_RATE_WH_S > 0 else 0.0
+            if charge_dur > 0:
+                yield self.env.timeout(charge_dur)
+                soc_before = self.bus_soc.get(bus_id, capacity)
+                new_soc = min(capacity, soc_before + energy)
+                self.bus_soc[bus_id] = new_soc
+                self.bus_energy_charged[bus_id] += energy
+                # Deduct energy from MAP battery
+                map_state.current_soc_wh = max(map_floor, map_state.current_soc_wh - energy)
+                self.map_movement_scheduler.record_map_soc(following_map, float(self.env.now))
+                self.map_tracker.record_charge(
+                    map_id=following_map, bus_id=bus_id,
+                    start_time=t_start, end_time=float(self.env.now),
+                    energy_wh=energy, location=f"stop_{stop_id}",
+                    soc_before=soc_before, soc_after=new_soc,
+                    charging_type="terminal"
+                )
+                if new_soc >= target_wh or map_state.current_soc_wh <= map_floor:
+                    self.map_movement_scheduler.stop_following(following_map)
+            return
+
+        # --- Case 2: no MAP following; request one if bus needs charge ---
+        if soc >= BUS_CHARGE_THRESHOLD_SOC * capacity:
+            return
+
+        map_id = self.map_movement_scheduler.get_available_map(stop_id)
+        if map_id is None:
+            return
+
+        travel_time_s, _ = self.map_movement_scheduler.spawn_or_travel_to(map_id, stop_id)
+
+        # Check MAP still has usable energy after travel (long independent journey may drain it)
+        map_state = self.map_movement_scheduler.map_states[map_id]
+        map_floor = MAP_MIN_SOC * map_state.battery_capacity_wh
+        if map_state.current_soc_wh <= map_floor:
+            self.map_movement_scheduler._schedule_recharge(map_id)
+            return
+
+        remaining = layover_duration_s - travel_time_s
+        if remaining <= 0:
+            return
+
+        if travel_time_s > 0:
+            yield self.env.timeout(travel_time_s)
+
+        self.map_movement_scheduler.start_following(map_id, bus_id)
+        soc = self.bus_soc.get(bus_id, capacity)
+        t_start = float(self.env.now)
+        # Limit to energy above 10 % floor
+        available_map_energy = map_state.current_soc_wh - map_floor
+        energy = min(MAP_CHARGING_RATE_WH_S * remaining,
+                     max(0.0, target_wh - soc),
+                     available_map_energy)
+        charge_dur = energy / MAP_CHARGING_RATE_WH_S if (MAP_CHARGING_RATE_WH_S > 0 and energy > 0) else 0.0
+        if charge_dur > 0:
+            yield self.env.timeout(charge_dur)
+            soc_before = self.bus_soc.get(bus_id, capacity)
+            new_soc = min(capacity, soc_before + energy)
+            self.bus_soc[bus_id] = new_soc
+            self.bus_energy_charged[bus_id] += energy
+            # Deduct energy from MAP battery (never below floor)
+            map_state.current_soc_wh = max(map_floor, map_state.current_soc_wh - energy)
+            self.map_movement_scheduler.record_map_soc(map_id, float(self.env.now))
+            self.map_tracker.record_charge(
+                map_id=map_id, bus_id=bus_id,
+                start_time=t_start, end_time=float(self.env.now),
+                energy_wh=energy, location=f"stop_{stop_id}",
+                soc_before=soc_before, soc_after=new_soc,
+                charging_type="terminal"
+            )
+            if new_soc >= target_wh or map_state.current_soc_wh <= map_floor:
+                self.map_movement_scheduler.stop_following(map_id)
 
     def run_simulation(self, duration_s: float = 86400) -> Dict:
         """Run DES simulation"""
@@ -1077,11 +1715,11 @@ class Stage2DESTerminalChargingPreemptive:
         return stats
 
     def _simulate_bus(self, bus_id: str, trip_ids: List[str]):
-        """Simulate a single bus"""
+        """Simulate a single bus with dynamic en-route MAP charging."""
 
         try:
             line_id = bus_id.split('_')[0].replace('line', '')
-        except:
+        except Exception:
             line_id = "unknown"
 
         capacity = self.battery_capacity_wh
@@ -1106,112 +1744,65 @@ class Stage2DESTerminalChargingPreemptive:
             trip_start = seq[0]["arrival"]
             idle_dt = max(0.0, trip_start - current_time)
 
+            # --- Inter-trip idle / layover phase ---
             if idle_dt > 0:
-                yield self.env.timeout(idle_dt)
-                current_time = trip_start
-
                 try:
                     start_node = self.sim.stop_node.get(seq[0].get("stop_id"))
                 except Exception:
                     start_node = None
 
-                if (prev_end_node is not None and start_node is not None and
-                    prev_end_node == start_node and prev_end_time is not None):
+                is_terminal = (
+                    prev_end_node is not None and start_node is not None
+                    and prev_end_node == start_node and prev_end_time is not None
+                )
+                start_stop_id = seq[0].get("stop_id")
 
+                if is_terminal and start_stop_id in self.trip_change_stops:
                     duration = trip_start - prev_end_time
-                    start_stop_id = seq[0].get("stop_id")
+                    soc_now = self.bus_soc.get(bus_id, capacity)
 
-                    if duration > 0 and start_stop_id in self.trip_change_stops:
-                        soc_now = self.bus_soc.get(bus_id, capacity)
+                    next_trip_id = (trip_ids[trip_idx + 1]
+                                    if trip_idx + 1 < len(trip_ids) else None)
+                    layover = LayoverRecord(
+                        bus_id=bus_id,
+                        line_id=line_id,
+                        current_trip_id=trip_id,
+                        next_trip_id=next_trip_id,
+                        arrival_at_terminal_s=prev_end_time,
+                        departure_from_terminal_s=trip_start,
+                        layover_duration_s=duration,
+                        location=f"stop_{start_stop_id}",
+                        stop_id=start_stop_id,
+                        soc_at_arrival_wh=soc_now,
+                        soc_at_departure_wh=soc_now
+                    )
 
-                        next_trip_id = trip_ids[trip_idx + 1] if trip_idx + 1 < len(trip_ids) else None
-                        layover = LayoverRecord(
-                            bus_id=bus_id,
-                            line_id=line_id,
-                            current_trip_id=trip_id,
-                            next_trip_id=next_trip_id,
-                            arrival_at_terminal_s=prev_end_time,
-                            departure_from_terminal_s=trip_start,
-                            layover_duration_s=duration,
-                            location=f"stop_{start_stop_id}",
-                            stop_id=start_stop_id,
-                            soc_at_arrival_wh=soc_now,
-                            soc_at_departure_wh=soc_now
-                        )
+                    # Handle terminal charging (generator sub-process)
+                    energy_before = sum(self.bus_energy_charged.values())
+                    yield from self._terminal_charge(bus_id, start_stop_id, duration, capacity)
+                    energy_after = sum(self.bus_energy_charged.values())
 
-                        # Check if bus needs charging and assign MAP if available
-                        if self.stop_charging_manager.charging_enabled and soc_now < 0.7 * capacity:
-                            # Request MAP movement to this location
-                            map_id = 0  # Start with first available MAP
-                            if map_id < self.num_maps:
-                                travel_time_distance = self.map_movement_scheduler.assign_map_to_bus(
-                                    map_id=map_id,
-                                    bus_id=bus_id,
-                                    current_location=self.map_movement_scheduler.get_map_location(map_id),
-                                    target_location=start_stop_id
-                                )
+                    # Wait for the remainder of the layover
+                    time_used = float(self.env.now) - (trip_start - duration)
+                    remaining_idle = max(0.0, duration - time_used)
+                    if remaining_idle > 0:
+                        yield self.env.timeout(remaining_idle)
 
-                                if travel_time_distance:
-                                    travel_time_s, distance_m = travel_time_distance
-                                    # Wait for MAP to arrive, then request charging
-                                    yield self.env.timeout(travel_time_s)
+                    energy_charged = energy_after - energy_before
+                    if energy_charged > 0:
+                        layover.was_charged = True
+                        layover.energy_charged_wh = energy_charged
 
-                                    # Now attempt charging
-                                    started, actual_dur, amount = self.stop_charging_manager.request_stop_charging(
-                                        stop_id=start_stop_id,
-                                        bus_id=bus_id,
-                                        soc_wh=soc_now,
-                                        capacity_wh=capacity,
-                                        desired_duration_s=duration - travel_time_s
-                                    )
+                    layover.soc_at_departure_wh = self.bus_soc.get(bus_id, capacity)
+                    self.layovers.append(layover)
+                    self.bus_soc_history[bus_id].append(
+                        (self.env.now, self.bus_soc.get(bus_id, capacity)))
+                else:
+                    yield self.env.timeout(idle_dt)
 
-                                    # Wait for charging to complete
-                                    if started and actual_dur > 0:
-                                        yield self.env.timeout(actual_dur)
-                                else:
-                                    # MAP already at location
-                                    started, actual_dur, amount = self.stop_charging_manager.request_stop_charging(
-                                        stop_id=start_stop_id,
-                                        bus_id=bus_id,
-                                        soc_wh=soc_now,
-                                        capacity_wh=capacity,
-                                        desired_duration_s=duration
-                                    )
+                current_time = trip_start
 
-                                    if started and actual_dur > 0:
-                                        yield self.env.timeout(actual_dur)
-                        else:
-                            # Normal charging request without MAP movement
-                            started, actual_dur, amount = self.stop_charging_manager.request_stop_charging(
-                                stop_id=start_stop_id,
-                                bus_id=bus_id,
-                                soc_wh=soc_now,
-                                capacity_wh=capacity,
-                                desired_duration_s=duration
-                            )
-
-                        # Wait for the full layover duration
-                        yield self.env.timeout(duration)
-
-                        recent_events = [e for e in self.stop_charging_manager.get_charging_events()
-                                       if e['bus_id'] == bus_id and
-                                       prev_end_time <= e['start_time_s'] <= trip_start]
-
-                        if recent_events:
-                            total_charged = sum(e['energy_wh'] for e in recent_events)
-                            layover.was_charged = True
-                            layover.energy_charged_wh = total_charged
-
-                        preemptions = [p for p in self.stop_charging_manager.get_preemption_events()
-                                     if p['interrupted_bus'] == bus_id and p['stop_id'] == start_stop_id]
-                        if preemptions:
-                            layover.was_preempted = True
-
-                        layover.soc_at_departure_wh = self.bus_soc.get(bus_id, capacity)
-                        self.layovers.append(layover)
-
-                        self.bus_soc_history[bus_id].append((self.env.now, self.bus_soc.get(bus_id, capacity)))
-
+            # --- Trip segment execution ---
             for i in range(1, len(seq)):
                 prev_stop = seq[i - 1]
                 curr_stop = seq[i]
@@ -1227,20 +1818,103 @@ class Stage2DESTerminalChargingPreemptive:
                 except Exception:
                     dist = 0.0
 
+                # Pre-segment check: release MAP before travel if bus is already fully
+                # charged OR the MAP has no energy left. This prevents the MAP from
+                # riding along for a segment where it can deliver nothing.
+                pre_following = self.map_movement_scheduler.get_following_map_for_bus(bus_id)
+                if pre_following is not None:
+                    pre_map_state = self.map_movement_scheduler.map_states[pre_following]
+                    pre_soc = self.bus_soc.get(bus_id, capacity)
+                    if (pre_soc >= BUS_CHARGE_CUTOFF_SOC * capacity
+                            or pre_map_state.current_soc_wh <= 0):
+                        self.map_movement_scheduler.stop_following(pre_following)
+
                 yield self.env.timeout(max(0.0, dt))
                 current_time = curr_stop["arrival"]
 
-                energy = dist * ENERGY_PER_METER_WH
+                # 1. Apply energy consumption for this segment
+                energy_consumed = dist * ENERGY_PER_METER_WH
                 prev_soc = self.bus_soc.get(bus_id, capacity)
-                new_soc = max(0.0, prev_soc - energy)
+                new_soc = max(0.0, prev_soc - energy_consumed)
                 self.bus_soc[bus_id] = new_soc
 
-                self.buses[bus_id]['total_energy_consumed_wh'] += energy
-
+                self.buses[bus_id]['total_energy_consumed_wh'] += energy_consumed
                 if new_soc < self.buses[bus_id]['min_soc_wh']:
                     self.buses[bus_id]['min_soc_wh'] = new_soc
 
-                self.bus_soc_history[bus_id].append((self.env.now, self.bus_soc.get(bus_id, capacity)))
+                curr_stop_id = curr_stop.get("stop_id")
+                curr_lat = curr_stop.get("lat")
+                curr_lon = curr_stop.get("lon")
+
+                # 2. If a MAP is following, deliver en-route segment charge
+                following_map = self.map_movement_scheduler.get_following_map_for_bus(bus_id)
+                if following_map is not None:
+                    was_following_map = following_map  # remember for location update
+                    soc = self.bus_soc[bus_id]
+                    target_wh = BUS_CHARGE_CUTOFF_SOC * capacity
+                    map_state = self.map_movement_scheduler.map_states[following_map]
+                    map_floor = MAP_MIN_SOC * map_state.battery_capacity_wh
+                    # Only deliver energy above the 10 % MAP SOC floor
+                    available_map_energy = map_state.current_soc_wh - map_floor
+                    if soc < target_wh and dt > 0 and available_map_energy > 0:
+                        seg_energy = min(
+                            MAP_CHARGING_RATE_WH_S * max(0.0, dt),
+                            target_wh - soc,
+                            available_map_energy
+                        )
+                        if seg_energy > 0:
+                            t_start = float(self.env.now) - max(0.0, dt)
+                            soc_before = soc
+                            new_charged_soc = min(capacity, soc + seg_energy)
+                            self.bus_soc[bus_id] = new_charged_soc
+                            self.bus_energy_charged[bus_id] += seg_energy
+                            # Deduct delivered energy from MAP battery (never below floor)
+                            map_state.current_soc_wh = max(map_floor,
+                                                           map_state.current_soc_wh - seg_energy)
+                            self.map_movement_scheduler.record_map_soc(following_map, float(self.env.now))
+                            self.map_tracker.record_charge(
+                                map_id=following_map, bus_id=bus_id,
+                                start_time=t_start, end_time=float(self.env.now),
+                                energy_wh=seg_energy,
+                                location=f"stop_{curr_stop_id}",
+                                soc_before=soc_before, soc_after=new_charged_soc,
+                                charging_type="en_route_segment"
+                            )
+                            if new_charged_soc >= target_wh or map_state.current_soc_wh <= map_floor:
+                                self.map_movement_scheduler.stop_following(following_map)
+                                following_map = None
+
+                    # Update MAP location to current stop (MAP traveled with bus this segment)
+                    self.map_movement_scheduler.update_location_following_bus(
+                        was_following_map, curr_stop_id, curr_lat, curr_lon)
+
+                    # Release MAP if travel energy has now brought it to or below its floor
+                    if following_map is not None:
+                        fmap_state = self.map_movement_scheduler.map_states[following_map]
+                        if fmap_state.current_soc_wh <= MAP_MIN_SOC * fmap_state.battery_capacity_wh:
+                            self.map_movement_scheduler.stop_following(following_map)
+
+                # 3. If no MAP following and SOC is below threshold, request one
+                if (self.map_movement_scheduler.get_following_map_for_bus(bus_id) is None
+                        and self.num_maps > 0
+                        and self.bus_soc[bus_id] < BUS_CHARGE_THRESHOLD_SOC * capacity):
+                    available_map = self.map_movement_scheduler.get_available_map(
+                        curr_stop_id, curr_lat, curr_lon)
+                    if available_map is not None:
+                        # Spawn at bus location (0 time) or travel to bus (non-blocking,
+                        # energy deducted for travel distance)
+                        self.map_movement_scheduler.spawn_or_travel_to(
+                            available_map, curr_stop_id, curr_lat, curr_lon)
+                        amap_state = self.map_movement_scheduler.map_states[available_map]
+                        amap_floor = MAP_MIN_SOC * amap_state.battery_capacity_wh
+                        # Only start following if MAP still has usable energy after travel
+                        if amap_state.current_soc_wh > amap_floor:
+                            self.map_movement_scheduler.start_following(available_map, bus_id)
+                        else:
+                            self.map_movement_scheduler._schedule_recharge(available_map)
+
+                self.bus_soc_history[bus_id].append(
+                    (self.env.now, self.bus_soc.get(bus_id, capacity)))
 
             prev_end_node = self.sim.stop_node.get(seq[-1].get("stop_id"))
             prev_end_stop_id = seq[-1].get("stop_id")
@@ -1268,17 +1942,16 @@ class Stage2DESTerminalChargingPreemptive:
             min_soc_overall = min(min_soc_overall, min_soc_ratio)
 
         total_energy_charged = sum(self.bus_energy_charged.values())
-        num_preemptions = len(self.stop_charging_manager.get_preemption_events())
 
         return {
             'battery_capacity_wh': self.battery_capacity_wh,
             'num_maps': self.num_maps,
-            'charging_enabled': self.stop_charging_manager.charging_enabled,
+            'charging_enabled': self.num_maps > 0,
             'preemption_threshold': self.preemption_threshold,
             'trip_change_stops': len(self.trip_change_stops),
             'num_buses': len(self.buses),
             'num_layovers': len(self.layovers),
-            'num_preemptions': num_preemptions,
+            'num_preemptions': 0,  # No preemption in dynamic en-route charging model
             'min_soc_overall_ratio': min_soc_overall,
             'min_soc_overall_wh': min_soc_overall * self.battery_capacity_wh,
             'min_soc_threshold': BUS_MIN_SOC,
@@ -1307,9 +1980,9 @@ class Stage2DESTerminalChargingPreemptive:
     def print_charging_events(self, num_to_print: int = 10):
         """Print charging events"""
 
-        events = self.stop_charging_manager.get_charging_events()
+        records = self.map_tracker.charging_records
 
-        if not events:
+        if not records:
             print("\n" + "="*70)
             print("NO CHARGING EVENTS")
             print("="*70 + "\n")
@@ -1318,33 +1991,26 @@ class Stage2DESTerminalChargingPreemptive:
         print("\n" + "="*70)
         print(f"CHARGING EVENTS (First {num_to_print})")
         print("="*70)
-        print(f"\n{'Bus ID':<20} {'MAP ID':<8} {'Start Time (s)':<18} {'Duration (s)':<15} {'Energy (Wh)':<15}")
-        print("-"*95)
+        print(f"\n{'Bus ID':<20} {'MAP ID':<8} {'Start Time (s)':<18} {'Duration (s)':<15} {'Energy (Wh)':<15} {'Type':<20}")
+        print("-"*115)
 
-        for event in events[:num_to_print]:
-            print(f"{event['bus_id']:<20} {event['map_id']:<8} "
-                  f"{event['start_time_s']:<18.1f} {event['duration_s']:<15.1f} {event['energy_wh']:<15.0f}")
+        for record in records[:num_to_print]:
+            print(f"{record.bus_id:<20} {record.map_id:<8} "
+                  f"{record.start_time_s:<18.1f} {record.duration_s:<15.1f} "
+                  f"{record.energy_delivered_wh:<15.0f} {record.charging_type:<20}")
 
-        if len(events) > num_to_print:
-            print(f"\n... and {len(events) - num_to_print} more events")
+        if len(records) > num_to_print:
+            print(f"\n... and {len(records) - num_to_print} more events")
 
-        print(f"\nTotal charging events: {len(events)}")
+        print(f"\nTotal charging events: {len(records)}")
 
     def print_preemption_events(self):
-        """Print all preemption events"""
-
-        preemptions = self.stop_charging_manager.get_preemption_events()
-
-        if not preemptions:
-            print("\n" + "="*70)
-            print("NO PREEMPTION EVENTS")
-            print("="*70 + "\n")
-            return
+        """Print all preemption events (none in dynamic en-route charging model)"""
 
         print("\n" + "="*70)
-        print(f"PREEMPTION EVENTS ({len(preemptions)} total)")
-        print("="*70)
-        print(f"\nTotal preemptions: {len(preemptions)}\n")
+        print("NO PREEMPTION EVENTS")
+        print("  (Dynamic en-route charging model does not use preemption)")
+        print("="*70 + "\n")
 
     def print_map_usage(self):
         """Print MAP usage statistics"""
@@ -1358,16 +2024,25 @@ class Stage2DESTerminalChargingPreemptive:
         """Print MAP movement statistics"""
         summary = self.map_movement_scheduler.get_summary()
 
+        # Column widths: 8+10+12+15+20+12+15+15 = 107 chars + 7 spaces = 114
+        _SEP_WIDTH = 114
+
         print("\n" + "="*70)
         print("MAP MOVEMENT STATISTICS")
         print("="*70)
-        print(f"\n{'MAP ID':<8} {'Current Location':<20} {'Current SOC (Wh)':<20} {'Distance (km)':<15} {'Charging Events':<15}")
-        print("-"*100)
+        print(f"\n{'MAP ID':<8} {'Spawned':<10} {'Recharging':<12} {'Following Bus':<15} "
+              f"{'Current Location':<20} {'SOC':<12} {'Distance (km)':<15} {'Charging Events':<15}")
+        print("-"*_SEP_WIDTH)
 
         for map_id, state_summary in summary.items():
             distance_km = state_summary['distance_traveled_m'] / 1000
-            print(f"{map_id:<8} {state_summary['current_location']:<20} "
-                  f"{state_summary['current_soc_wh']:<20.0f} {distance_km:<15.1f} "
+            loc = state_summary['current_location'] or "unspawned"
+            spawned_str = "Yes" if state_summary.get('spawned') else "No"
+            recharging_str = "Yes" if state_summary.get('is_recharging') else "No"
+            following_str = str(state_summary.get('assigned_bus') or "-")
+            soc_str = f"{state_summary['current_soc_pct']:.1f}%"
+            print(f"{map_id:<8} {spawned_str:<10} {recharging_str:<12} {following_str:<15} "
+                  f"{loc:<20} {soc_str:<12} {distance_km:<15.1f} "
                   f"{state_summary['num_charging_events']:<15}")
 
         print(f"\n{'='*70}\n")
@@ -1563,6 +2238,641 @@ class Stage2DESTerminalChargingPreemptive:
         print(f"Plot saved to: {save_path}")
         plt.show()
 
+    def plot_map_soc(self, save_path: str = "map_soc_trajectories.png"):
+        """Plot MAP battery SOC (%) versus simulation time for each MAP."""
+
+        has_data = any(
+            len(self.map_movement_scheduler.map_soc_history.get(mid, [])) > 1
+            for mid in range(self.num_maps)
+        )
+        if not has_data:
+            print("No MAP SOC history to plot")
+            return
+
+        plt.figure(figsize=(14, 7))
+        colors = plt.cm.tab10(np.linspace(0, 1, max(self.num_maps, 1)))
+
+        for map_id in range(self.num_maps):
+            history = self.map_movement_scheduler.map_soc_history.get(map_id, [])
+            if len(history) < 2:
+                continue
+            cap_wh = self.map_movement_scheduler.map_states[map_id].battery_capacity_wh
+            times = [h[0] / 3600 for h in history]
+            soc_pct = [h[1] / cap_wh * 100.0 for h in history]
+            plt.plot(times, soc_pct, linewidth=2, label=f'MAP {map_id} (cap {cap_wh/1000:.0f} kWh)',
+                     color=colors[map_id])
+
+        plt.axhline(y=100.0, color='green', linestyle='--', linewidth=1.5, alpha=0.6, label='100 %')
+        plt.axhline(y=0.0, color='red', linestyle='--', linewidth=1.5, alpha=0.6, label='0 %')
+        plt.ylim(-5, 110)
+        plt.xlabel('Time (hours)', fontweight='bold', fontsize=12)
+        plt.ylabel('MAP Battery SOC (%)', fontweight='bold', fontsize=12)
+        plt.title('MAP Battery State of Charge vs Time', fontweight='bold', fontsize=13)
+        plt.legend(loc='best', fontsize=10)
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Plot saved to: {save_path}")
+        plt.show()
+
+# ========================
+# BASELINE SIMULATION
+# ========================
+
+class BaselineTerminalChargingSimulation:
+    """Baseline DES scenario: one stationary MAP per terminal, charging buses
+    during layover times only.
+
+    Rules
+    -----
+    * One MAP is placed permanently at each trip-change stop (terminal).
+    * MAPs never follow buses — they act as fixed chargers at their terminal.
+    * A bus requests the terminal charger whenever its SOC drops below
+      ``BUS_CHARGE_THRESHOLD_SOC`` (70 %).  Waiting buses are ordered by SOC
+      so the most depleted bus is served first.
+    * **Preemption**: a bus currently being charged is *interrupted* only if a
+      newly arriving bus's SOC is below the *preemption threshold* (derived from
+      :class:`PreemptionStrategyAnalyzer`).  Buses whose SOC falls between the
+      preemption threshold and 70 % join the queue but do not interrupt an
+      ongoing session.
+    * MAPs recharge themselves at their terminal depot whenever they are not
+      serving a bus.  The self-recharge rate is ``MAP_RECHARGE_RATE_WH_S``.
+    * The MAP 10 % SOC floor is respected: a MAP only charges a bus with the
+      energy above ``MAP_MIN_SOC × capacity``.
+    * Buses may still fall below 20 % SOC if the terminal layover time or the
+      MAP's available energy is insufficient — this is captured in the results
+      so a post-simulation comparison can flag where the baseline fails.
+    """
+
+    def __init__(self, sim, bus_trips_dict: Dict[str, List[str]],
+                 trip_change_stops: set,
+                 initial_battery_capacity_wh: float = 250000,
+                 map_battery_capacity_wh: float = MAP_BATTERY_CAPACITY_WH,
+                 map_charging_rate_wh_s: float = MAP_CHARGING_RATE_WH_S,
+                 map_recharge_rate_wh_s: float = MAP_RECHARGE_RATE_WH_S,
+                 preemption_threshold: Optional[float] = None):
+        """
+        Parameters
+        ----------
+        preemption_threshold : float or None
+            SOC fraction (0–1) used to decide whether a newly-arriving bus may
+            *interrupt* a bus that is already being charged.  When the arriving
+            bus's SOC is strictly below this value it is considered critical and
+            will preempt the ongoing charging session.  Buses whose SOC is at
+            or above this value will join the queue but will not interrupt an
+            ongoing charge.
+
+            All buses still *request* charging whenever their SOC is below
+            ``BUS_CHARGE_THRESHOLD_SOC`` (70 %); the preemption threshold only
+            controls *interruption* priority, not whether a bus requests
+            charging at all.
+
+            When *None* (the default) the threshold is derived automatically by
+            :class:`PreemptionStrategyAnalyzer`, which analyses the actual
+            per-trip energy consumption to pick a value in the [0.25, 0.60]
+            range.  Pass an explicit value to override that recommendation.
+        """
+        self.sim = sim
+        self.bus_trips_dict = bus_trips_dict
+        self.trip_change_stops = trip_change_stops
+        self.battery_capacity_wh = initial_battery_capacity_wh
+        self.map_battery_capacity_wh = map_battery_capacity_wh
+        self.map_charging_rate_wh_s = map_charging_rate_wh_s
+        self.map_recharge_rate_wh_s = map_recharge_rate_wh_s
+
+        # ----------------------------------------------------------------
+        # Determine the preemption threshold
+        # ----------------------------------------------------------------
+        if preemption_threshold is not None:
+            self.preemption_threshold = float(preemption_threshold)
+            print(f"\nBaseline preemption threshold (provided): "
+                  f"{self.preemption_threshold*100:.1f}% SOC")
+        else:
+            print("\nAnalyzing bus energy patterns for baseline preemption threshold …")
+            num_maps = max(1, len(trip_change_stops))
+            analyzer = PreemptionStrategyAnalyzer(
+                sim, bus_trips_dict, initial_battery_capacity_wh, num_maps
+            )
+            self.preemption_threshold = analyzer.recommend_preemption_threshold()
+            if self.preemption_threshold is None:
+                # Fallback (e.g. no trips analyzed)
+                self.preemption_threshold = BUS_CHARGE_THRESHOLD_SOC
+                print(f"  Could not determine threshold — using default "
+                      f"{BUS_CHARGE_THRESHOLD_SOC*100:.0f}% SOC")
+            else:
+                print(f"  PreemptionStrategyAnalyzer recommended threshold: "
+                      f"{self.preemption_threshold*100:.1f}% SOC")
+
+        self.env = simpy.Environment()
+
+        # One MAP per terminal stop.  Each MAP has its own SimPy Resource
+        # (capacity = 1) and SOC state.  Priority is inverted: lower numeric
+        # priority value = served first, so we use ``-soc_wh`` as priority.
+        self._map_soc: Dict[str, float] = {
+            s: map_battery_capacity_wh for s in trip_change_stops
+        }
+        self._map_soc_history: Dict[str, List] = {
+            s: [(0.0, map_battery_capacity_wh)] for s in trip_change_stops
+        }
+        # SimPy PriorityResource: lower priority value → served first.
+        self._chargers: Dict[str, simpy.PriorityResource] = {
+            s: simpy.PriorityResource(self.env, capacity=1)
+            for s in trip_change_stops
+        }
+        # Track ongoing self-recharge processes so they can be interrupted.
+        self._recharge_procs: Dict[str, object] = {}
+
+        self.bus_soc: Dict[str, float] = {}
+        self.bus_energy_charged: Dict[str, float] = defaultdict(float)
+        self.bus_soc_history: Dict[str, List] = defaultdict(list)
+
+        self.layovers: List[LayoverRecord] = []
+
+        # Preemption tracking
+        self._preemption_count: int = 0
+
+        # Per-bus minimum SOC tracking
+        self._bus_min_soc: Dict[str, float] = {}
+        self._bus_total_energy_consumed: Dict[str, float] = defaultdict(float)
+
+        # Charging event log for the tracker
+        self.charging_events: List[Dict] = []
+
+    # ------------------------------------------------------------------
+    # MAP self-recharge processes
+    # ------------------------------------------------------------------
+
+    def _start_map_recharge(self, stop_id: str):
+        """Start a self-recharge SimPy process for the MAP at *stop_id*."""
+        soc = self._map_soc[stop_id]
+        cap = self.map_battery_capacity_wh
+        if soc >= cap:
+            return
+        proc = self._recharge_procs.get(stop_id)
+        if proc is not None and proc.is_alive:
+            return
+        proc = self.env.process(self._map_recharge_process(stop_id))
+        self._recharge_procs[stop_id] = proc
+
+    def _map_recharge_process(self, stop_id: str):
+        """Generator: recharge a MAP at *stop_id* until full."""
+        cap = self.map_battery_capacity_wh
+        try:
+            while self._map_soc[stop_id] < cap:
+                needed = cap - self._map_soc[stop_id]
+                time_to_full = needed / self.map_recharge_rate_wh_s
+                yield self.env.timeout(time_to_full)
+                self._map_soc[stop_id] = cap
+                self._map_soc_history[stop_id].append((float(self.env.now), cap))
+        except simpy.Interrupt:
+            pass
+        finally:
+            self._recharge_procs.pop(stop_id, None)
+
+    def _interrupt_map_recharge(self, stop_id: str):
+        """Interrupt any ongoing recharge process for the MAP at *stop_id*."""
+        proc = self._recharge_procs.get(stop_id)
+        if proc is not None and proc.is_alive:
+            try:
+                proc.interrupt()
+            except RuntimeError:
+                pass
+
+    # ------------------------------------------------------------------
+    # Bus simulation
+    # ------------------------------------------------------------------
+
+    def _simulate_bus(self, bus_id: str, trip_ids: List[str]):
+        """SimPy generator for one bus."""
+        try:
+            line_id = bus_id.split('_')[0].replace('line', '')
+        except Exception:
+            line_id = "unknown"
+
+        capacity = self.battery_capacity_wh
+        self.bus_soc[bus_id] = capacity
+        self._bus_min_soc[bus_id] = capacity
+        self.bus_soc_history[bus_id].append((0.0, capacity))
+
+        current_time = 0.0
+        prev_end_node = None
+        prev_end_time = None
+
+        for trip_idx, trip_id in enumerate(trip_ids):
+            try:
+                seq = self.sim.gtfs.stop_sequence(trip_id)
+            except Exception:
+                continue
+            if not seq:
+                continue
+
+            trip_start = seq[0]["arrival"]
+            idle_dt = max(0.0, trip_start - current_time)
+
+            # --- Inter-trip layover phase ---
+            if idle_dt > 0:
+                try:
+                    start_node = self.sim.stop_node.get(seq[0].get("stop_id"))
+                except Exception:
+                    start_node = None
+
+                is_terminal = (
+                    prev_end_node is not None and start_node is not None
+                    and prev_end_node == start_node and prev_end_time is not None
+                )
+                start_stop_id = seq[0].get("stop_id")
+
+                if is_terminal and start_stop_id in self.trip_change_stops:
+                    duration = trip_start - prev_end_time
+                    soc_now = self.bus_soc.get(bus_id, capacity)
+
+                    next_trip_id = (trip_ids[trip_idx + 1]
+                                    if trip_idx + 1 < len(trip_ids) else None)
+                    layover = LayoverRecord(
+                        bus_id=bus_id,
+                        line_id=line_id,
+                        current_trip_id=trip_id,
+                        next_trip_id=next_trip_id,
+                        arrival_at_terminal_s=prev_end_time,
+                        departure_from_terminal_s=trip_start,
+                        layover_duration_s=duration,
+                        location=f"stop_{start_stop_id}",
+                        stop_id=start_stop_id,
+                        soc_at_arrival_wh=soc_now,
+                        soc_at_departure_wh=soc_now,
+                    )
+
+                    energy_before = self.bus_energy_charged[bus_id]
+                    yield from self._terminal_charge_baseline(
+                        bus_id, start_stop_id, duration, capacity)
+
+                    # Wait for remainder of layover
+                    time_used = float(self.env.now) - (trip_start - duration)
+                    remaining_idle = max(0.0, duration - time_used)
+                    if remaining_idle > 0:
+                        yield self.env.timeout(remaining_idle)
+
+                    energy_charged = self.bus_energy_charged[bus_id] - energy_before
+                    if energy_charged > 0:
+                        layover.was_charged = True
+                        layover.energy_charged_wh = energy_charged
+
+                    layover.soc_at_departure_wh = self.bus_soc.get(bus_id, capacity)
+                    self.layovers.append(layover)
+                    self.bus_soc_history[bus_id].append(
+                        (float(self.env.now), self.bus_soc.get(bus_id, capacity)))
+                else:
+                    yield self.env.timeout(idle_dt)
+
+                current_time = trip_start
+
+            # --- Trip segment execution ---
+            for i in range(1, len(seq)):
+                prev_stop = seq[i - 1]
+                curr_stop = seq[i]
+                dt = curr_stop["arrival"] - prev_stop["arrival"]
+
+                try:
+                    _, _, dist = self.sim.geod.inv(
+                        prev_stop["lon"], prev_stop["lat"],
+                        curr_stop["lon"], curr_stop["lat"]
+                    )
+                    dist = abs(dist)
+                except Exception:
+                    dist = 0.0
+
+                yield self.env.timeout(max(0.0, dt))
+                current_time = curr_stop["arrival"]
+
+                energy_consumed = dist * ENERGY_PER_METER_WH
+                prev_soc = self.bus_soc.get(bus_id, capacity)
+                new_soc = max(0.0, prev_soc - energy_consumed)
+                self.bus_soc[bus_id] = new_soc
+                self._bus_total_energy_consumed[bus_id] += energy_consumed
+                if new_soc < self._bus_min_soc.get(bus_id, capacity):
+                    self._bus_min_soc[bus_id] = new_soc
+
+                self.bus_soc_history[bus_id].append(
+                    (float(self.env.now), new_soc))
+
+            prev_end_node = self.sim.stop_node.get(seq[-1].get("stop_id"))
+            prev_end_time = seq[-1]["arrival"]
+
+    def _terminal_charge_baseline(self, bus_id: str, stop_id: str,
+                                   layover_duration_s: float, capacity: float):
+        """Generator: compete for the terminal charger with SOC-based preemption.
+
+        Every bus whose SOC is below ``BUS_CHARGE_THRESHOLD_SOC`` (70 %) will
+        request the terminal charger.  The SimPy PriorityResource orders
+        waiting buses by SOC (lowest SOC served first).
+
+        *Preemption* — interrupting a bus that is currently being charged — is
+        only triggered when the requesting bus's SOC is strictly below
+        ``self.preemption_threshold`` (derived from
+        :class:`PreemptionStrategyAnalyzer`).  This means only critically-low
+        buses interrupt an ongoing session; buses that are merely below 70 %
+        SOC join the queue without disrupting a running charge.
+        """
+        soc = self.bus_soc.get(bus_id, capacity)
+        target_wh = BUS_CHARGE_CUTOFF_SOC * capacity
+
+        if soc >= BUS_CHARGE_THRESHOLD_SOC * capacity:
+            return  # Bus SOC is at or above 70 % — charging not needed
+
+        charger = self._chargers.get(stop_id)
+        if charger is None:
+            return  # No MAP at this terminal
+
+        # Priority: lower numeric value = served first → use negative SOC
+        priority = -soc
+        # Only preempt (interrupt) the currently-charging bus if this bus
+        # is critically low (below the preemption threshold).
+        can_preempt = soc < self.preemption_threshold * capacity
+        req = charger.request(priority=priority, preempt=can_preempt)
+        t_request = float(self.env.now)
+
+        # Try to acquire the charger within the layover window
+        result = yield req | self.env.timeout(layover_duration_s)
+
+        if req not in result:
+            # Timeout — could not acquire charger in time
+            charger.release(req)
+            return
+
+        # Acquired the charger — preemption may have occurred
+        if req.preempt:
+            self._preemption_count += 1
+
+        # Stop MAP self-recharge while it is serving a bus
+        self._interrupt_map_recharge(stop_id)
+
+        t_start = float(self.env.now)
+        map_floor = MAP_MIN_SOC * self.map_battery_capacity_wh
+        available_map_energy = self._map_soc[stop_id] - map_floor
+
+        if available_map_energy <= 0:
+            charger.release(req)
+            self._start_map_recharge(stop_id)
+            return
+
+        # Re-read current bus SOC (may have changed while waiting)
+        soc = self.bus_soc.get(bus_id, capacity)
+        time_left = max(0.0, layover_duration_s - (t_start - t_request))
+        energy = min(
+            self.map_charging_rate_wh_s * time_left,
+            max(0.0, target_wh - soc),
+            available_map_energy
+        )
+        charge_dur = energy / self.map_charging_rate_wh_s if (
+            self.map_charging_rate_wh_s > 0 and energy > 0) else 0.0
+
+        if charge_dur > 0:
+            try:
+                yield self.env.timeout(charge_dur)
+            except simpy.Interrupt:
+                # Preempted by a lower-SOC bus
+                charge_dur = float(self.env.now) - t_start
+                energy = self.map_charging_rate_wh_s * charge_dur
+
+            soc_before = self.bus_soc.get(bus_id, capacity)
+            new_soc = min(capacity, soc_before + energy)
+            self.bus_soc[bus_id] = new_soc
+            self.bus_energy_charged[bus_id] += energy
+            # Deduct from MAP battery (never below floor)
+            self._map_soc[stop_id] = max(map_floor, self._map_soc[stop_id] - energy)
+            self._map_soc_history[stop_id].append(
+                (float(self.env.now), self._map_soc[stop_id]))
+            self.charging_events.append({
+                "bus_id": bus_id,
+                "stop_id": stop_id,
+                "start_time_s": t_start,
+                "end_time_s": float(self.env.now),
+                "energy_wh": energy,
+                "soc_before_wh": soc_before,
+                "soc_after_wh": new_soc,
+            })
+
+        charger.release(req)
+        # MAP resumes self-recharge if not immediately claimed by another bus
+        self._start_map_recharge(stop_id)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def run_simulation(self, duration_s: float = 86400) -> Dict:
+        """Run the baseline DES and return a results dict."""
+        print("\n" + "=" * 70)
+        print("BASELINE: STATIONARY-MAP TERMINAL CHARGING WITH PREEMPTION")
+        print("=" * 70)
+        print(f"Bus battery capacity:  {self.battery_capacity_wh/1000:,.1f} kWh")
+        print(f"MAP battery capacity:  {self.map_battery_capacity_wh/1000:,.1f} kWh")
+        print(f"MAP charging rate:     {self.map_charging_rate_wh_s:.2f} Wh/s")
+        print(f"MAP self-recharge:     {self.map_recharge_rate_wh_s:.2f} Wh/s")
+        print(f"Charging threshold:    {BUS_CHARGE_THRESHOLD_SOC*100:.0f}% SOC "
+              f"(buses request charging below this)")
+        print(f"Preemption threshold:  {self.preemption_threshold*100:.1f}% SOC "
+              f"(buses below this may interrupt an ongoing charge)")
+        print(f"Terminal stops:        {len(self.trip_change_stops)}")
+        print(f"  (one stationary MAP per terminal)")
+        print(f"Simulation duration:   {duration_s/3600:,.1f} hours\n")
+
+        for bus_id, trip_ids in self.bus_trips_dict.items():
+            self.env.process(self._simulate_bus(bus_id, trip_ids))
+
+        print(f"Running baseline simulation until t={duration_s}s...")
+        self.env.run(until=duration_s)
+        print(f"Baseline simulation complete!\n")
+
+        return self._collect_statistics()
+
+    def _collect_statistics(self) -> Dict:
+        bus_stats = {}
+        min_soc_overall = float('inf')
+        buses_below_floor: List[str] = []
+
+        for bus_id in self.bus_trips_dict:
+            capacity = self.battery_capacity_wh
+            soc_wh = self.bus_soc.get(bus_id, capacity)
+            min_soc_wh = self._bus_min_soc.get(bus_id, capacity)
+            min_soc_ratio = min_soc_wh / capacity
+
+            bus_stats[bus_id] = {
+                "final_soc_wh": soc_wh,
+                "final_soc_ratio": soc_wh / capacity,
+                "min_soc_wh": min_soc_wh,
+                "min_soc_ratio": min_soc_ratio,
+                "energy_charged_wh": self.bus_energy_charged.get(bus_id, 0.0),
+                "total_energy_consumed_wh": self._bus_total_energy_consumed.get(bus_id, 0.0),
+            }
+            min_soc_overall = min(min_soc_overall, min_soc_ratio)
+            if min_soc_ratio < BUS_MIN_SOC:
+                buses_below_floor.append(bus_id)
+
+        total_energy_charged = sum(self.bus_energy_charged.values())
+        num_terminals = len(self.trip_change_stops)
+        num_maps = num_terminals  # one per terminal
+
+        map_stats = {}
+        for stop_id in self.trip_change_stops:
+            soc_wh = self._map_soc[stop_id]
+            cap = self.map_battery_capacity_wh
+            map_stats[stop_id] = {
+                "final_soc_wh": soc_wh,
+                "final_soc_pct": soc_wh / cap * 100.0,
+            }
+
+        return {
+            "scenario": "baseline",
+            "battery_capacity_wh": self.battery_capacity_wh,
+            "num_maps": num_maps,
+            "num_terminals": num_terminals,
+            "charging_enabled": True,
+            "preemption_threshold": self.preemption_threshold,
+            "preemption_count": self._preemption_count,
+            "num_layovers": len(self.layovers),
+            "min_soc_overall_ratio": min_soc_overall if min_soc_overall < float('inf') else 1.0,
+            "feasible": min_soc_overall >= BUS_MIN_SOC,
+            "buses_below_floor": buses_below_floor,
+            "total_energy_charged_wh": total_energy_charged,
+            "bus_statistics": bus_stats,
+            "map_statistics": map_stats,
+        }
+
+    def print_results(self, results: Optional[Dict] = None):
+        """Print a summary of the baseline simulation results."""
+        if results is None:
+            results = self._collect_statistics()
+
+        print("\n" + "=" * 70)
+        print("BASELINE SIMULATION RESULTS")
+        print("=" * 70)
+        print(f"\nFEASIBILITY CHECK:")
+        print(f"  Bus battery capacity:  {results['battery_capacity_wh']/1000:,.1f} kWh")
+        print(f"  Terminals (= MAPs):    {results['num_terminals']}")
+        print(f"  Charging threshold:    {BUS_CHARGE_THRESHOLD_SOC*100:.0f}% SOC "
+              f"(all buses below this request charging)")
+        thr = results.get('preemption_threshold')
+        if thr is not None:
+            print(f"  Preemption threshold:  {thr*100:.1f}% SOC "
+                  f"(buses below this interrupt ongoing charges)")
+        print(f"  Preemptions occurred:  {results['preemption_count']}")
+        print(f"  Minimum bus SOC seen:  {results['min_soc_overall_ratio']*100:.1f}%")
+        if results['feasible']:
+            print(f"  ✓ FEASIBLE: all buses stayed above {BUS_MIN_SOC*100:.0f}% SOC")
+        else:
+            n_fail = len(results['buses_below_floor'])
+            print(f"  ✗ INFEASIBLE: {n_fail} bus(es) fell below {BUS_MIN_SOC*100:.0f}% SOC")
+
+        print(f"\nCHARGING STATISTICS:")
+        print(f"  Total layovers:        {results['num_layovers']}")
+        print(f"  Total energy charged:  {results['total_energy_charged_wh']/1e6:,.3f} MWh")
+
+        if results['buses_below_floor']:
+            print(f"\nBuses that fell below {BUS_MIN_SOC*100:.0f}% SOC (first 10):")
+            for b in results['buses_below_floor'][:10]:
+                st = results['bus_statistics'][b]
+                print(f"  {b:<22} min={st['min_soc_ratio']*100:.1f}%  "
+                      f"charged={st['energy_charged_wh']/1000:.1f} kWh")
+            if len(results['buses_below_floor']) > 10:
+                print(f"  … and {len(results['buses_below_floor']) - 10} more")
+
+        print(f"\nMAP Final SOC by Terminal:")
+        for stop_id, ms in sorted(results['map_statistics'].items()):
+            bar = "█" * int(ms['final_soc_pct'] / 5)
+            print(f"  {stop_id:<16} {ms['final_soc_pct']:>6.1f}%  {bar}")
+
+        print("=" * 70 + "\n")
+
+    def plot_soc(self, save_path: str = "baseline_bus_soc.png"):
+        """Plot bus SOC trajectories for the baseline simulation."""
+        plt.figure(figsize=(14, 8))
+
+        cmap = plt.get_cmap("tab10")
+        lines_seen: Dict[str, object] = {}
+        next_color_idx = 0
+
+        for bus_id, series in self.bus_soc_history.items():
+            filtered = [x for x in series if x[0] > 0]
+            if not filtered:
+                continue
+            t = [x[0] / 3600 for x in filtered]
+            s = [x[1] / self.battery_capacity_wh * 100.0 for x in filtered]
+
+            line_key = "default"
+            try:
+                if bus_id.startswith("line"):
+                    line_key = bus_id[4:].split("_", 1)[0]
+            except Exception:
+                pass
+
+            if line_key not in lines_seen:
+                lines_seen[line_key] = cmap(next_color_idx % cmap.N)
+                next_color_idx += 1
+
+            plt.plot(t, s, color=lines_seen[line_key], linewidth=1, alpha=0.5)
+
+        plt.axhline(y=BUS_CHARGE_CUTOFF_SOC * 100, color="green", linestyle="--",
+                    linewidth=2, alpha=0.5, label=f"{BUS_CHARGE_CUTOFF_SOC*100:.0f}% charge-to target")
+        plt.axhline(y=BUS_CHARGE_THRESHOLD_SOC * 100, color="orange", linestyle="--",
+                    linewidth=2, alpha=0.5, label=f"{BUS_CHARGE_THRESHOLD_SOC*100:.0f}% charging threshold (request)")
+        plt.axhline(y=self.preemption_threshold * 100, color="purple", linestyle="-.",
+                    linewidth=2, alpha=0.7,
+                    label=f"{self.preemption_threshold*100:.1f}% preemption threshold (interrupt)")
+        plt.axhline(y=BUS_MIN_SOC * 100, color="red", linestyle="--",
+                    linewidth=2, alpha=0.5, label=f"{BUS_MIN_SOC*100:.0f}% minimum")
+
+        plt.ylim(bottom=0, top=105)
+        plt.xlabel("Time (hours)", fontweight="bold")
+        plt.ylabel("Bus SOC (%)", fontweight="bold")
+        plt.title("Baseline — Bus SOC Trajectories (Terminal Charging, Preemption)",
+                  fontweight="bold")
+        plt.legend(loc="best")
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=300, bbox_inches="tight")
+        print(f"Plot saved to: {save_path}")
+        plt.close()
+
+    def plot_map_soc(self, save_path: str = "baseline_map_soc.png"):
+        """Plot MAP (terminal charger) SOC over time."""
+        has_data = any(
+            len(h) > 1 for h in self._map_soc_history.values()
+        )
+        if not has_data:
+            print("No MAP SOC history to plot (baseline)")
+            return
+
+        plt.figure(figsize=(14, 7))
+        n_stops = len(self.trip_change_stops)
+        cmap = plt.cm.tab10(np.linspace(0, 1, n_stops)) if n_stops > 0 else []
+
+        for idx, stop_id in enumerate(sorted(self.trip_change_stops)):
+            history = self._map_soc_history.get(stop_id, [])
+            if len(history) < 2:
+                continue
+            cap = self.map_battery_capacity_wh
+            times = [h[0] / 3600 for h in history]
+            soc_pct = [h[1] / cap * 100.0 for h in history]
+            plt.plot(times, soc_pct, linewidth=2,
+                     label=f"Terminal {stop_id}", color=cmap[idx])
+
+        plt.axhline(y=MAP_MIN_SOC * 100, color="red", linestyle="--",
+                    linewidth=1.5, alpha=0.8, label=f"{MAP_MIN_SOC*100:.0f}% floor")
+        plt.ylim(-5, 110)
+        plt.xlabel("Time (hours)", fontweight="bold", fontsize=12)
+        plt.ylabel("MAP SOC (%)", fontweight="bold", fontsize=12)
+        plt.title("Baseline — MAP (Terminal Charger) Battery SOC vs Time",
+                  fontweight="bold", fontsize=13)
+        plt.legend(loc="best", fontsize=8)
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=300, bbox_inches="tight")
+        print(f"Plot saved to: {save_path}")
+        plt.close()
+
+
 # ========================
 # SIMULATION RUNNER
 # ========================
@@ -1572,9 +2882,53 @@ def run_terminal_charging_simulation(sim, bus_trips_dict, bus_lines, trip_change
                                     num_maps: int = 1,
                                     optimize_threshold: bool = True,
                                     preemption_threshold: Optional[float] = None,
-                                    simulation_duration_s: float = 86400):
-    """Execute terminal charging simulation with MAP tracking"""
+                                    simulation_duration_s: float = 86400,
+                                    map_battery_capacity_wh: Optional[Union[float, List[float]]] = None):
+    """Execute terminal charging simulation with MAP tracking.
 
+    Before the DES run the function invokes :class:`ChargingStrategyOptimizer`
+    to recommend the best per-bus charging method (terminal / en_route / hybrid)
+    and to flag whether the configured MAP fleet is large enough.
+
+    After the DES run the function invokes :class:`DepotPlacementOptimizer` to
+    cluster MAP deployment locations and recommend where physical depots (fast-
+    charging stations for MAPs) should be placed.
+
+    Parameters
+    ----------
+    sim                      : GTFSBusSim instance
+    bus_trips_dict           : {bus_id: [trip_id, ...]}
+    bus_lines                : list of BusLine objects
+    trip_change_stops        : set of stop IDs where terminal layovers happen
+    battery_capacity_wh      : bus battery capacity (Wh)
+    num_maps                 : number of MAPs in the fleet
+    optimize_threshold       : if True, auto-tune the preemption SOC threshold
+    preemption_threshold     : override for the preemption SOC threshold
+    simulation_duration_s    : how long to run the DES (seconds)
+    map_battery_capacity_wh  : MAP battery capacity (float or list of floats)
+    """
+    # ------------------------------------------------------------------
+    # 1. Pre-simulation: charging strategy optimisation
+    # ------------------------------------------------------------------
+    map_cap_scalar = (
+        map_battery_capacity_wh
+        if isinstance(map_battery_capacity_wh, (int, float)) and map_battery_capacity_wh
+        else MAP_BATTERY_CAPACITY_WH
+    )
+    strategy_opt = ChargingStrategyOptimizer(
+        sim=sim,
+        bus_trips_dict=bus_trips_dict,
+        battery_capacity_wh=battery_capacity_wh,
+        num_maps=num_maps,
+        map_battery_capacity_wh=float(map_cap_scalar),
+        map_charging_rate_wh_s=MAP_CHARGING_RATE_WH_S,
+        trip_change_stops=trip_change_stops,
+    )
+    strategy_opt.print_summary()
+
+    # ------------------------------------------------------------------
+    # 2. DES simulation
+    # ------------------------------------------------------------------
     stage2 = Stage2DESTerminalChargingPreemptive(
         sim=sim,
         bus_trips_dict=bus_trips_dict,
@@ -1583,7 +2937,8 @@ def run_terminal_charging_simulation(sim, bus_trips_dict, bus_lines, trip_change
         initial_battery_capacity_wh=battery_capacity_wh,
         num_maps=num_maps,
         optimize_threshold=optimize_threshold,
-        preemption_threshold=preemption_threshold
+        preemption_threshold=preemption_threshold,
+        map_battery_capacity_wh=map_battery_capacity_wh
     )
 
     results = stage2.run_simulation(simulation_duration_s)
@@ -1596,7 +2951,7 @@ def run_terminal_charging_simulation(sim, bus_trips_dict, bus_lines, trip_change
     # Print MAP usage
     stage2.print_map_usage()
     stage2.print_map_assignments()
-    stage2.print_map_movement()  # NEW: Print MAP movement statistics
+    stage2.print_map_movement()
     stage2.print_bus_charging_schedule(num_to_print=5)
 
     # Print simulation results
@@ -1606,35 +2961,153 @@ def run_terminal_charging_simulation(sim, bus_trips_dict, bus_lines, trip_change
 
     print("\nFEASIBILITY CHECK:")
     print("-"*70)
-    print(f"Battery capacity: {results['battery_capacity_wh']/1000:,.1f} kWh")
-    print(f"Trip-change stops: {results['trip_change_stops']}")
-    print(f"Available MAPs: {results['num_maps']}")
-    print(f"Charging enabled: {'YES' if results['charging_enabled'] else 'NO'}")
+    print(f"Bus battery capacity:  {results['battery_capacity_wh']/1000:,.1f} kWh")
+    print(f"MAP min SOC floor:     {MAP_MIN_SOC*100:.0f}%  (MAPs never discharge below this)")
+    print(f"Trip-change stops:     {results['trip_change_stops']}")
+    print(f"Available MAPs:        {results['num_maps']}")
+    print(f"Charging enabled:      {'YES' if results['charging_enabled'] else 'NO'}")
 
     if results['preemption_threshold'] is not None:
-        print(f"Preemption threshold: {results['preemption_threshold']*100:.1f}% SOC")
+        print(f"Preemption threshold:  {results['preemption_threshold']*100:.1f}% SOC")
     else:
-        print(f"Preemption threshold: DISABLED")
+        print(f"Preemption threshold:  DISABLED")
 
-    print(f"Minimum SOC reached: {results['min_soc_overall_ratio']*100:.1f}%")
+    print(f"Minimum bus SOC seen:  {results['min_soc_overall_ratio']*100:.1f}%")
 
     if results['feasible']:
-        print(f"✓ FEASIBLE: Min SOC stays above 20%")
+        print(f"✓ FEASIBLE: all buses stayed above {BUS_MIN_SOC*100:.0f}% SOC")
     else:
-        print(f"✗ INFEASIBLE")
+        print(f"✗ INFEASIBLE: some buses fell below {BUS_MIN_SOC*100:.0f}% SOC")
 
     print("\nCHARGING STATISTICS:")
     print("-"*70)
-    print(f"Total layovers: {results['num_layovers']}")
-    print(f"Total preemptions: {results['num_preemptions']}")
-    print(f"Total energy charged: {results['total_energy_charged_wh']/1e6:,.3f} MWh")
+    print(f"Total layovers:        {results['num_layovers']}")
+    print(f"Total preemptions:     {results['num_preemptions']}")
+    print(f"Total energy charged:  {results['total_energy_charged_wh']/1e6:,.3f} MWh")
+
+    ct_breakdown = stage2.map_tracker.get_summary().get('charging_type_breakdown', {})
+    if ct_breakdown:
+        print(f"\nCharging breakdown by type:")
+        for ctype, stats in sorted(ct_breakdown.items()):
+            print(f"  {ctype:<20}: {stats['events']:>5} events, "
+                  f"{stats['energy_wh']/1000:,.1f} kWh")
 
     print("\n" + "="*70)
 
-    # Plots
+    # ------------------------------------------------------------------
+    # 3. Post-simulation: depot placement optimisation
+    # ------------------------------------------------------------------
+    depot_opt = DepotPlacementOptimizer(
+        map_tracker=stage2.map_tracker,
+        map_movement_scheduler=stage2.map_movement_scheduler,
+        num_maps=num_maps,
+        map_battery_capacity_wh=float(map_cap_scalar),
+    )
+    depot_opt.print_summary()
+    depot_opt.plot_depot_map(save_path="depot_placement.png")
+
+    # ------------------------------------------------------------------
+    # 4. Plots
+    # ------------------------------------------------------------------
     stage2.plot_soc(save_path="bus_soc_terminal_charging_optimized.png")
     stage2.plot_map_energy_delivery(save_path="map_energy_delivery.png")
     stage2.plot_cumulative_energy_delivery(save_path="cumulative_energy_delivery.png")
-    stage2.plot_map_movement(save_path="map_movement_distance.png")  # NEW: Plot MAP movement
+    stage2.plot_map_movement(save_path="map_movement_distance.png")
+    stage2.plot_map_soc(save_path="map_soc_trajectories.png")
 
     return results, stage2
+
+
+def run_baseline_simulation(sim, bus_trips_dict, trip_change_stops,
+                            battery_capacity_wh: float = 250000,
+                            map_battery_capacity_wh: float = MAP_BATTERY_CAPACITY_WH,
+                            map_charging_rate_wh_s: float = MAP_CHARGING_RATE_WH_S,
+                            map_recharge_rate_wh_s: float = MAP_RECHARGE_RATE_WH_S,
+                            preemption_threshold: Optional[float] = None,
+                            simulation_duration_s: float = 86400) -> Dict:
+    """Run the baseline stationary-MAP simulation and compare against the
+    offline charging-strategy optimum.
+
+    Baseline rules
+    --------------
+    * One MAP is permanently stationed at each terminal (trip-change stop).
+    * MAPs charge buses **only during terminal layovers** using preemption
+      (lowest-SOC bus is served first).
+    * MAPs self-recharge at their terminal depot when idle.
+    * No bus-following; no en-route charging.
+    * The SOC threshold that triggers charging (and drives preemption priority)
+      is obtained from :class:`PreemptionStrategyAnalyzer` unless an explicit
+      value is supplied via *preemption_threshold*.
+
+    After the simulation the function runs :class:`ChargingStrategyOptimizer`
+    (which performs an offline analysis using bus energy profiles) and calls
+    :meth:`ChargingStrategyOptimizer.compare_with_baseline` to determine
+    whether a more aggressive (dynamic/en-route) strategy would be beneficial.
+
+    Parameters
+    ----------
+    sim                      : GTFSBusSim instance
+    bus_trips_dict           : {bus_id: [trip_id, ...]}
+    trip_change_stops        : set of stop IDs that act as terminals
+    battery_capacity_wh      : bus battery capacity (Wh)
+    map_battery_capacity_wh  : MAP battery capacity (Wh)
+    map_charging_rate_wh_s   : MAP-to-bus charging rate (Wh/s)
+    map_recharge_rate_wh_s   : MAP self-recharge rate (Wh/s)
+    preemption_threshold     : SOC fraction (0–1) below which a newly-arriving
+                               bus may *interrupt* (preempt) an ongoing
+                               charging session at the terminal.  Buses whose
+                               SOC is in the range (preemption_threshold, 70%)
+                               will still request charging but will join the
+                               queue without interrupting the current session.
+                               Pass *None* (default) to let
+                               :class:`PreemptionStrategyAnalyzer` choose
+                               the value automatically.
+    simulation_duration_s    : length of simulation (seconds)
+
+    Returns
+    -------
+    dict with keys ``baseline_results`` and ``comparison``.
+    """
+    # ------------------------------------------------------------------
+    # 1. Baseline DES simulation
+    # ------------------------------------------------------------------
+    baseline = BaselineTerminalChargingSimulation(
+        sim=sim,
+        bus_trips_dict=bus_trips_dict,
+        trip_change_stops=trip_change_stops,
+        initial_battery_capacity_wh=battery_capacity_wh,
+        map_battery_capacity_wh=map_battery_capacity_wh,
+        map_charging_rate_wh_s=map_charging_rate_wh_s,
+        map_recharge_rate_wh_s=map_recharge_rate_wh_s,
+        preemption_threshold=preemption_threshold,
+    )
+    baseline_results = baseline.run_simulation(simulation_duration_s)
+    baseline.print_results(baseline_results)
+
+    # Plots
+    baseline.plot_soc(save_path="baseline_bus_soc.png")
+    baseline.plot_map_soc(save_path="baseline_map_soc.png")
+
+    # ------------------------------------------------------------------
+    # 2. Post-simulation: offline strategy analysis + comparison
+    # ------------------------------------------------------------------
+    num_terminals = len(trip_change_stops)
+    strategy_opt = ChargingStrategyOptimizer(
+        sim=sim,
+        bus_trips_dict=bus_trips_dict,
+        battery_capacity_wh=battery_capacity_wh,
+        num_maps=num_terminals,
+        map_battery_capacity_wh=map_battery_capacity_wh,
+        map_charging_rate_wh_s=map_charging_rate_wh_s,
+        trip_change_stops=trip_change_stops,
+    )
+    strategy_opt.print_summary()
+
+    comparison = strategy_opt.compare_with_baseline(baseline_results)
+
+    return {
+        "baseline_results": baseline_results,
+        "comparison": comparison,
+        "baseline_sim": baseline,
+        "strategy_optimizer": strategy_opt,
+    }
