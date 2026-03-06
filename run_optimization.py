@@ -144,7 +144,7 @@ def main():
                     'num_preemptions': results['num_preemptions']
                 })
 
-                # Run post-simulation MILP optimisation
+                # Run post-simulation MILP optimization
                 milp_results = post_simulation_optimize(
                     results, stage2_sim, bus_lines
                 )

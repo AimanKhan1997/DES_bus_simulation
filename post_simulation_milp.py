@@ -168,8 +168,8 @@ def run_milp_optimization(sim_data,
     sys_data = sim_data['system']
 
     sim_battery_wh = sys_data['sim_battery_wh']
-    sim_num_maps = max(1, sys_data['sim_num_maps'])
-    sim_map_battery_wh = max(1.0, sys_data['sim_map_battery_wh'])
+    sim_num_maps = sys_data['sim_num_maps']
+    sim_map_battery_wh = sys_data['sim_map_battery_wh']
     total_energy_consumed = sys_data['total_energy_consumed_wh']
     total_energy_charged = sys_data['total_energy_charged_wh']
 
@@ -185,8 +185,14 @@ def run_milp_optimization(sim_data,
     # Scaling factor: relates (N_map × B_map) to total energy charged
     #   E_charged ∝ N_map × usable_energy_per_MAP
     #   usable_energy_per_MAP ∝ B_map
-    scaling_factor = (total_energy_charged
-                      / (sim_num_maps * sim_map_battery_wh))
+    # When the simulation had no MAPs, no historical charging data exists
+    # to calibrate the scaling; set to 0 so the MILP can still add MAPs
+    # but overnight energy stays at total consumption.
+    if sim_num_maps > 0 and sim_map_battery_wh > 0:
+        scaling_factor = (total_energy_charged
+                          / (sim_num_maps * sim_map_battery_wh))
+    else:
+        scaling_factor = 0.0
 
     # ---------------------------------------------------------------
     # Model
@@ -205,7 +211,7 @@ def run_milp_optimization(sim_data,
 
     N_map = model.addVar(lb=0, ub=max_maps, vtype=GRB.INTEGER, name="N_map")
 
-    # Auxiliary: W ≈ N_map × B_map  (linearised via McCormick envelopes)
+    # Auxiliary: W ≈ N_map × B_map  (linearized via McCormick envelopes)
     W = model.addVar(lb=0.0, ub=max_maps * map_cap_max_kwh,
                      vtype=GRB.CONTINUOUS, name="W_NmapBmap")
 
@@ -249,6 +255,9 @@ def run_milp_optimization(sim_data,
     # ---------------------------------------------------------------
     # Constraints
     # ---------------------------------------------------------------
+    # Big-M for linking slack to violation indicator.
+    # The maximum possible slack equals the energy deficit (~500 kWh × 1000 = 5e5 Wh),
+    # so 1e7 provides a safe margin without causing numerical issues.
     BIG_M = 1e7
 
     # 1. Bus SOC ≥ 20%  (per bus, with penalty slack)
