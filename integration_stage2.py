@@ -25,8 +25,12 @@ BUS_CHARGE_CUTOFF_SOC = 0.80
 BUS_MIN_SOC = 0.20
 
 MAX_CONCURRENT_CHARGERS = 2
-CHARGER_SPEED_MS = 27.78
+CHARGER_SPEED_MS = 37.78
 ENERGY_PER_METER_WH = 2.7
+
+MAP_BATTERY_CAPACITY_WH = 150000   # 150 kWh per MAP
+MAP_MIN_SOC = 0.10                 # MAP cannot go below 10% SOC
+MAP_SELF_CHARGE_RATE_WH_S = 233.0  # MAP self-charges at 233 Wh/s
 
 # ========================
 # MAP USAGE TRACKER (NEW)
@@ -88,6 +92,8 @@ class MAPUsageTracker:
         # Movement tracking (NEW)
         self.map_total_distance_m = defaultdict(float)  # {map_id: total_distance}
         self.map_movement_events = defaultdict(int)  # {map_id: num_movements}
+        # MAP SOC history for plotting {map_id: [(time_s, soc_wh)]}
+        self.map_soc_history = defaultdict(list)
 
     def record_charge(self, map_id: int, bus_id: str, start_time: float,
                      end_time: float, energy_wh: float, location: str,
@@ -495,7 +501,8 @@ class PreemptiveStopChargingManager:
                  policy: ChargingPolicy = None, on_charge=None,
                  preemption_threshold: Optional[float] = 0.40,
                  num_maps: int = 1,
-                 map_tracker: Optional[MAPUsageTracker] = None):
+                 map_tracker: Optional[MAPUsageTracker] = None,
+                 map_movement_scheduler: Optional['MAPMovementScheduler'] = None):
         self.env = env
         self.capacity = max(1, int(capacity_per_stop))
         self.policy = policy or ChargingPolicy()
@@ -503,6 +510,7 @@ class PreemptiveStopChargingManager:
         self.preemption_threshold = preemption_threshold
         self.num_maps = num_maps
         self.map_tracker = map_tracker
+        self.map_movement_scheduler = map_movement_scheduler
 
         self.charging_enabled = (num_maps > 0)
 
@@ -522,13 +530,34 @@ class PreemptiveStopChargingManager:
         if not self.charging_enabled:
             return False
         # Check global limit: only allow as many buses charging as there are MAPs
-        return self._global_active_count < self.num_maps
+        if self._global_active_count >= self.num_maps:
+            return False
+        # Check that at least one MAP is available (has energy and not self-charging)
+        if self.map_movement_scheduler:
+            any_available = any(
+                self.map_movement_scheduler.is_map_available(mid)
+                for mid in range(self.num_maps)
+            )
+            if not any_available:
+                return False
+        return True
 
     def _get_next_map_id(self) -> int:
-        """Get next MAP in round-robin fashion"""
-        map_id = self._current_map_id % self.num_maps
-        self._current_map_id += 1
-        return map_id
+        """Get next available MAP (round-robin, skipping unavailable ones)"""
+        if self.map_movement_scheduler:
+            for _ in range(self.num_maps):
+                map_id = self._current_map_id % self.num_maps
+                self._current_map_id += 1
+                if self.map_movement_scheduler.is_map_available(map_id):
+                    return map_id
+            # No available MAP found – return round-robin anyway (will be caught later)
+            map_id = self._current_map_id % self.num_maps
+            self._current_map_id += 1
+            return map_id
+        else:
+            map_id = self._current_map_id % self.num_maps
+            self._current_map_id += 1
+            return map_id
 
     def _start_session(self, stop_id: str, req: dict):
         """Start a charging session with MAP tracking and location verification"""
@@ -544,19 +573,24 @@ class PreemptiveStopChargingManager:
         if bus_id in self._buses_currently_charging:
             return (False, 0.0, 0.0)
 
+        # Assign MAP first so we can check its energy
+        map_id = self._get_next_map_id()
+
         amount = self.policy.charge_amount_for_duration(soc, cap, desired)
         if amount <= 0 or desired <= 0:
             return (False, 0.0, 0.0)
 
+        # Cap by MAP available energy
+        if self.map_movement_scheduler:
+            avail = self.map_movement_scheduler.available_energy_wh(map_id)
+            if avail <= 0:
+                return (False, 0.0, 0.0)
+            amount = min(amount, avail)
+
         duration = min(amount / self.policy.rate_wh_per_s, desired)
 
-        # Assign MAP and set its location
-        map_id = self._get_next_map_id()
-        self._map_locations[map_id] = stop_id  # MAP arrives at stop location
-
-        # Verify MAP is at the same location as the bus (both at stop_id)
-        if map_id in self._map_locations and self._map_locations[map_id] != stop_id:
-            return (False, 0.0, 0.0)
+        # Set MAP location
+        self._map_locations[map_id] = stop_id
 
         # Mark bus as currently charging
         self._buses_currently_charging.add(bus_id)
@@ -601,7 +635,11 @@ class PreemptiveStopChargingManager:
             map_id=map_id
         )
 
-        def _release(sid, dur, sess):
+        # Eagerly deduct energy from MAP so concurrent checks see correct SOC
+        if self.map_movement_scheduler:
+            self.map_movement_scheduler.update_map_soc(map_id, amount)
+
+        def _release(sid, dur, sess, delivered_amount):
             try:
                 yield self.env.timeout(dur)
                 if not sess.interrupted:
@@ -611,11 +649,17 @@ class PreemptiveStopChargingManager:
                             bus_id=sess.bus_id,
                             start_time=sess.start_time,
                             end_time=float(self.env.now),
-                            energy_wh=soc + amount - sess.soc_at_start,
+                            energy_wh=delivered_amount,
                             location=f"stop_{sid}",
                             soc_before=sess.soc_at_start,
-                            soc_after=min(cap, sess.soc_at_start + amount)
+                            soc_after=min(cap, sess.soc_at_start + delivered_amount)
                         )
+
+                    # If MAP SOC is at floor, trigger self-charging
+                    if self.map_movement_scheduler:
+                        if self.map_movement_scheduler.map_needs_self_charge(sess.map_id):
+                            self.env.process(
+                                self.map_movement_scheduler.self_charge_process(sess.map_id))
 
                     # Release resources
                     self._global_active_count = max(0, self._global_active_count - 1)
@@ -625,7 +669,7 @@ class PreemptiveStopChargingManager:
             except Exception:
                 pass
 
-        process = self.env.process(_release(stop_id, duration, session))
+        process = self.env.process(_release(stop_id, duration, session, amount))
         session.process_handle = process
         self._active_sessions[(stop_id, bus_id)] = session
 
@@ -727,9 +771,38 @@ class PreemptiveStopChargingManager:
 
     def _preempt_session(self, stop_id: str, session: ChargingSession,
                         new_bus_id: str, new_bus_soc: float):
-        """Preempt a charging session"""
+        """Preempt a charging session and refund undelivered energy to MAP"""
 
         session.interrupted = True
+
+        # Calculate how much energy was actually delivered before preemption
+        elapsed = float(self.env.now) - session.start_time
+        # Find the original planned amount from the charging event
+        planned_amount = 0.0
+        planned_duration = 0.0
+        for event in reversed(self._charging_events):
+            if event["bus_id"] == session.bus_id and event["stop_id"] == stop_id:
+                planned_amount = event["energy_wh"]
+                planned_duration = event["duration_s"]
+                event["preempted"] = True
+                break
+
+        if planned_duration > 0:
+            fraction_delivered = min(1.0, elapsed / planned_duration)
+        else:
+            fraction_delivered = 1.0
+        actual_delivered = planned_amount * fraction_delivered
+        undelivered = planned_amount - actual_delivered
+
+        # Refund undelivered energy to the MAP
+        if undelivered > 0 and self.map_movement_scheduler and session.map_id >= 0:
+            state = self.map_movement_scheduler.map_states.get(session.map_id)
+            if state:
+                state.current_soc_wh = min(state.battery_capacity_wh,
+                                           state.current_soc_wh + undelivered)
+                if self.map_tracker:
+                    self.map_tracker.map_soc_history[session.map_id].append(
+                        (float(self.env.now), state.current_soc_wh))
 
         preemption_event = {
             "stop_id": stop_id,
@@ -742,11 +815,6 @@ class PreemptiveStopChargingManager:
             "map_id": session.map_id
         }
         self._preemption_events.append(preemption_event)
-
-        for event in reversed(self._charging_events):
-            if event["bus_id"] == session.bus_id and event["stop_id"] == stop_id:
-                event["preempted"] = True
-                break
 
         if session.process_handle:
             try:
@@ -776,10 +844,10 @@ class PreemptiveStopChargingManager:
 # ========================
 
 class MAPMovementScheduler:
-    """Manages MAP movement, routing, and location tracking"""
+    """Manages MAP movement, routing, location tracking, and MAP energy"""
 
     def __init__(self, env: simpy.Environment, num_maps: int,
-                 map_battery_capacity_wh: float = 100000,
+                 map_battery_capacity_wh: float = MAP_BATTERY_CAPACITY_WH,
                  map_speed_ms: float = 27.78,
                  map_tracker: Optional[MAPUsageTracker] = None):
         self.env = env
@@ -797,6 +865,12 @@ class MAPMovementScheduler:
                 current_soc_wh=map_battery_capacity_wh,
                 battery_capacity_wh=map_battery_capacity_wh,
             )
+            # Record initial SOC
+            if map_tracker:
+                map_tracker.map_soc_history[map_id].append((0.0, map_battery_capacity_wh))
+
+        # Per-MAP self-charging flag
+        self._is_self_charging = {mid: False for mid in range(num_maps)}
 
         # Request queue for MAP assignments
         self.charging_requests = defaultdict(list)  # {map_id: [requests]}
@@ -897,11 +971,65 @@ class MAPMovementScheduler:
         return 0.0
 
     def update_map_soc(self, map_id: int, energy_consumed_wh: float):
-        """Update MAP SOC after charging a bus"""
+        """Update MAP SOC after charging a bus (energy is deducted from MAP battery).
+        SOC is clamped so it never drops below MAP_MIN_SOC floor."""
         if map_id in self.map_states:
             state = self.map_states[map_id]
-            state.current_soc_wh = max(0.0, state.current_soc_wh - energy_consumed_wh)
+            floor = MAP_MIN_SOC * state.battery_capacity_wh
+            state.current_soc_wh = max(floor, state.current_soc_wh - energy_consumed_wh)
             state.num_charging_events += 1
+            if self.map_tracker:
+                self.map_tracker.map_soc_history[map_id].append(
+                    (float(self.env.now), state.current_soc_wh))
+
+    def available_energy_wh(self, map_id: int) -> float:
+        """Return energy available for charging (above MAP_MIN_SOC floor).
+        Returns 0 if remaining is negligible (< 1 Wh) to avoid rounding issues."""
+        if map_id not in self.map_states:
+            return 0.0
+        state = self.map_states[map_id]
+        floor = MAP_MIN_SOC * state.battery_capacity_wh
+        avail = state.current_soc_wh - floor
+        return avail if avail >= 1.0 else 0.0
+
+    def map_needs_self_charge(self, map_id: int) -> bool:
+        """Check if MAP needs to self-charge (available energy is 0)"""
+        return self.available_energy_wh(map_id) <= 0.0
+
+    def is_map_available(self, map_id: int) -> bool:
+        """Check if MAP is available to charge a bus (not self-charging and has energy)"""
+        if self._is_self_charging.get(map_id, False):
+            return False
+        return self.available_energy_wh(map_id) > 0.0
+
+    def self_charge_process(self, map_id: int):
+        """SimPy process: self-charge a MAP back to full capacity at MAP_SELF_CHARGE_RATE_WH_S.
+        The MAP cannot charge buses while this process is running."""
+        if map_id not in self.map_states:
+            return
+        state = self.map_states[map_id]
+        if state.current_soc_wh >= state.battery_capacity_wh:
+            return  # already full
+
+        self._is_self_charging[map_id] = True
+        deficit = state.battery_capacity_wh - state.current_soc_wh
+        duration = deficit / MAP_SELF_CHARGE_RATE_WH_S
+
+        print(f"  [MAP {map_id}] Self-charging started at t={self.env.now:.0f}s "
+              f"(SOC {state.current_soc_wh/1000:.1f} kWh → {state.battery_capacity_wh/1000:.1f} kWh, "
+              f"duration {duration:.0f}s)")
+
+        yield self.env.timeout(duration)
+
+        state.current_soc_wh = state.battery_capacity_wh
+        self._is_self_charging[map_id] = False
+
+        if self.map_tracker:
+            self.map_tracker.map_soc_history[map_id].append(
+                (float(self.env.now), state.current_soc_wh))
+
+        print(f"  [MAP {map_id}] Self-charging complete at t={self.env.now:.0f}s "
+              f"(SOC {state.current_soc_wh/1000:.1f} kWh)")
 
     def map_is_at_location(self, map_id: int, location: str) -> bool:
         """Check if a MAP is at a specific location"""
@@ -997,7 +1125,7 @@ class Stage2DESTerminalChargingPreemptive:
         self.map_movement_scheduler = MAPMovementScheduler(
             self.env,
             num_maps=num_maps,
-            map_battery_capacity_wh=initial_battery_capacity_wh,
+            map_battery_capacity_wh=MAP_BATTERY_CAPACITY_WH,
             map_speed_ms=CHARGER_SPEED_MS,
             map_tracker=self.map_tracker
         )
@@ -1030,7 +1158,8 @@ class Stage2DESTerminalChargingPreemptive:
             on_charge=self._on_charge,
             preemption_threshold=self.preemption_threshold,
             num_maps=num_maps,
-            map_tracker=self.map_tracker
+            map_tracker=self.map_tracker,
+            map_movement_scheduler=self.map_movement_scheduler
         )
 
         self.bus_soc = defaultdict(float)
@@ -1057,6 +1186,7 @@ class Stage2DESTerminalChargingPreemptive:
         print(f"Battery capacity: {self.battery_capacity_wh/1000:,.1f} kWh")
         print(f"Trip-change stops: {len(self.trip_change_stops)}")
         print(f"Available MAPs: {self.num_maps}")
+        print(f"MAP battery: {MAP_BATTERY_CAPACITY_WH/1000:.0f} kWh | Min SOC: {MAP_MIN_SOC*100:.0f}% | Self-charge: {MAP_SELF_CHARGE_RATE_WH_S} Wh/s")
 
         if self.preemption_threshold is not None:
             print(f"Preemption threshold (OPTIMIZED): {self.preemption_threshold*100:.1f}% SOC")
@@ -1355,22 +1485,28 @@ class Stage2DESTerminalChargingPreemptive:
         self.map_tracker.print_detailed_assignments()
 
     def print_map_movement(self):
-        """Print MAP movement statistics"""
+        """Print MAP movement and battery statistics"""
         summary = self.map_movement_scheduler.get_summary()
 
         print("\n" + "="*70)
-        print("MAP MOVEMENT STATISTICS")
+        print("MAP MOVEMENT & BATTERY STATISTICS")
         print("="*70)
-        print(f"\n{'MAP ID':<8} {'Current Location':<20} {'Current SOC (Wh)':<20} {'Distance (km)':<15} {'Charging Events':<15}")
-        print("-"*100)
+        print(f"\n{'MAP ID':<8} {'Location':<20} {'SOC (kWh)':<12} {'SOC %':<8} {'Dist (km)':<12} {'Events':<8}")
+        print("-"*80)
 
         for map_id, state_summary in summary.items():
             distance_km = state_summary['distance_traveled_m'] / 1000
+            soc_kwh = state_summary['current_soc_wh'] / 1000
+            cap = self.map_movement_scheduler.map_states[map_id].battery_capacity_wh
+            soc_pct = (state_summary['current_soc_wh'] / cap * 100) if cap > 0 else 0
             print(f"{map_id:<8} {state_summary['current_location']:<20} "
-                  f"{state_summary['current_soc_wh']:<20.0f} {distance_km:<15.1f} "
-                  f"{state_summary['num_charging_events']:<15}")
+                  f"{soc_kwh:<12.1f} {soc_pct:<8.1f} {distance_km:<12.1f} "
+                  f"{state_summary['num_charging_events']:<8}")
 
-        print(f"\n{'='*70}\n")
+        print(f"\nMAP battery capacity: {MAP_BATTERY_CAPACITY_WH/1000:.0f} kWh | "
+              f"Min SOC: {MAP_MIN_SOC*100:.0f}% ({MAP_MIN_SOC*MAP_BATTERY_CAPACITY_WH/1000:.0f} kWh) | "
+              f"Self-charge rate: {MAP_SELF_CHARGE_RATE_WH_S} Wh/s")
+        print(f"{'='*70}\n")
 
     def print_bus_charging_schedule(self, num_to_print: int = 10):
         """Print bus charging schedule"""
@@ -1563,6 +1699,48 @@ class Stage2DESTerminalChargingPreemptive:
         print(f"Plot saved to: {save_path}")
         plt.show()
 
+    def plot_map_soc(self, save_path: str = "map_soc_over_time.png"):
+        """Plot MAP battery SOC levels over time"""
+
+        plt.figure(figsize=(14, 7))
+
+        colors = plt.cm.tab10(np.linspace(0, 1, max(1, self.num_maps)))
+        has_data = False
+
+        for map_id in range(self.num_maps):
+            series = self.map_tracker.map_soc_history.get(map_id, [])
+            if not series:
+                continue
+            has_data = True
+            t = [x[0] / 3600 for x in series]      # hours
+            s = [x[1] / 1000 for x in series]       # kWh
+            plt.plot(t, s, linewidth=2, label=f'MAP {map_id}',
+                     color=colors[map_id], alpha=0.9)
+
+        if not has_data:
+            print("No MAP SOC history to plot")
+            plt.close()
+            return
+
+        cap_kwh = MAP_BATTERY_CAPACITY_WH / 1000
+        plt.axhline(y=cap_kwh, color='green', linestyle='--',
+                     linewidth=1.5, alpha=0.6, label=f'Full ({cap_kwh:.0f} kWh)')
+        plt.axhline(y=MAP_MIN_SOC * cap_kwh, color='red', linestyle='--',
+                     linewidth=1.5, alpha=0.6,
+                     label=f'Min SOC {MAP_MIN_SOC*100:.0f}% ({MAP_MIN_SOC*cap_kwh:.0f} kWh)')
+
+        plt.ylim(bottom=0, top=cap_kwh * 1.05)
+        plt.xlabel('Time (hours)', fontweight='bold', fontsize=12)
+        plt.ylabel('MAP Battery SOC (kWh)', fontweight='bold', fontsize=12)
+        plt.title('MAP Battery SOC Over Time', fontweight='bold', fontsize=13)
+        plt.legend(loc='best', fontsize=10)
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Plot saved to: {save_path}")
+        plt.show()
+
 # ========================
 # SIMULATION RUNNER
 # ========================
@@ -1635,6 +1813,7 @@ def run_terminal_charging_simulation(sim, bus_trips_dict, bus_lines, trip_change
     stage2.plot_soc(save_path="bus_soc_terminal_charging_optimized.png")
     stage2.plot_map_energy_delivery(save_path="map_energy_delivery.png")
     stage2.plot_cumulative_energy_delivery(save_path="cumulative_energy_delivery.png")
-    stage2.plot_map_movement(save_path="map_movement_distance.png")  # NEW: Plot MAP movement
+    stage2.plot_map_movement(save_path="map_movement_distance.png")
+    stage2.plot_map_soc(save_path="map_soc_over_time.png")
 
     return results, stage2
