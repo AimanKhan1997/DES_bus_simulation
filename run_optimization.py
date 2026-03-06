@@ -4,6 +4,7 @@ FIXED: Properly handles num_maps=0 (no charging allowed)
 """
 
 from integration_stage2 import run_terminal_charging_simulation
+from post_simulation_milp import post_simulation_optimize
 from dataclasses import dataclass
 
 @dataclass
@@ -142,6 +143,11 @@ def main():
                     'min_soc_ratio': results['min_soc_overall_ratio'],
                     'num_preemptions': results['num_preemptions']
                 })
+
+                # Run post-simulation MILP optimisation
+                milp_results = post_simulation_optimize(
+                    results, stage2_sim, bus_lines
+                )
 
             except Exception as e:
                 print(f"ERROR: {e}")
