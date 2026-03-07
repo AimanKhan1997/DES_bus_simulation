@@ -212,13 +212,15 @@ def run_milp_optimization(sim_data,
     model = gp.Model("PostSimulation_BusMAP_MILP")
     model.setParam('OutputFlag', 1)
 
+    import math
+
     # --- decision variables ---
     # Bus battery capacity per line: discrete in steps of 10 kWh.
     # We introduce an integer helper K_l so that B_l = K_l × 10.
-    K = {}     # integer helper: K_l ∈ {bus_cap_min_kwh/10 .. bus_cap_max_kwh/10}
+    K = {}     # integer helper: K_l ∈ {ceil(min/10) .. floor(max/10)}
     B = {}     # derived continuous: B_l = K_l × 10  (kWh)
-    k_lb = int(bus_cap_min_kwh / 10)
-    k_ub = int(bus_cap_max_kwh / 10)
+    k_lb = math.ceil(bus_cap_min_kwh / 10)
+    k_ub = math.floor(bus_cap_max_kwh / 10)
     for l in line_ids:
         K[l] = model.addVar(lb=k_lb, ub=k_ub,
                             vtype=GRB.INTEGER, name=f"K_{l}")
