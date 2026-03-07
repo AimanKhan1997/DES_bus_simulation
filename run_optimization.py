@@ -108,7 +108,20 @@ def main():
     print("TESTING BATTERY CAPACITIES WITH AUTOMATIC THRESHOLD OPTIMIZATION")
     print("="*70)
 
-    # FIXED: Now you can test with num_maps=0 and charging will be disabled
+    # Per-line battery capacities (kWh)
+    LINE_BATTERY_CAPACITIES_KWH = {
+        "1": 270,
+        "2": 130,
+        "3": 280,
+        "4": 200,
+        "6": 50,
+    }
+    # Convert to Wh for the simulation
+    line_battery_capacities_wh = {
+        lid: cap * 1000 for lid, cap in LINE_BATTERY_CAPACITIES_KWH.items()
+    }
+
+    # Default fallback capacity (used if a line is not in the per-line map)
     battery_capacities_kwh = [140]
     num_maps_options = [2]
     results_summary = []
@@ -118,7 +131,9 @@ def main():
 
         for num_maps in num_maps_options:
             print(f"\n{'='*70}")
-            print(f"Battery: {capacity_kwh} kWh | MAPs: {num_maps}")
+            print(f"Default Battery: {capacity_kwh} kWh | MAPs: {num_maps}")
+            for lid, cap in sorted(LINE_BATTERY_CAPACITIES_KWH.items()):
+                print(f"  Line {lid}: {cap} kWh")
             print(f"{'='*70}")
 
             try:
@@ -128,10 +143,11 @@ def main():
                     bus_lines=bus_lines,
                     trip_change_stops=trip_change_stops,
                     battery_capacity_wh=capacity_wh,
-                    num_maps=num_maps,  # FIXED: Now properly handles 0
+                    num_maps=num_maps,
                     optimize_threshold=True,
                     preemption_threshold=None,
-                    simulation_duration_s=86400
+                    simulation_duration_s=86400,
+                    line_battery_capacities_wh=line_battery_capacities_wh
                 )
 
                 results_summary.append({

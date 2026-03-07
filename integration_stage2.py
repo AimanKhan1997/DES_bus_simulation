@@ -1084,7 +1084,8 @@ class Stage2DESTerminalChargingPreemptive:
                  initial_battery_capacity_wh: float = 250000,
                  num_maps: int = 1,
                  optimize_threshold: bool = True,
-                 preemption_threshold: Optional[float] = None):
+                 preemption_threshold: Optional[float] = None,
+                 line_battery_capacities_wh: Optional[Dict[str, float]] = None):
 
         self.sim = sim
         self.bus_trips_dict = bus_trips_dict
@@ -1092,6 +1093,8 @@ class Stage2DESTerminalChargingPreemptive:
         self.trip_change_stops = trip_change_stops
         self.battery_capacity_wh = initial_battery_capacity_wh
         self.num_maps = num_maps
+        # Per-line battery capacities (Wh); falls back to initial_battery_capacity_wh
+        self.line_battery_capacities_wh = line_battery_capacities_wh or {}
 
         # Initialize MAP tracker
         self.map_tracker = MAPUsageTracker(num_maps)
@@ -1139,11 +1142,12 @@ class Stage2DESTerminalChargingPreemptive:
             except:
                 line_id = "unknown"
 
+            bus_cap = self._get_bus_capacity(line_id)
             self.buses[bus_id] = {
                 'line_id': line_id,
                 'trip_ids': trip_ids,
-                'soc_wh': initial_battery_capacity_wh,
-                'min_soc_wh': initial_battery_capacity_wh,
+                'soc_wh': bus_cap,
+                'min_soc_wh': bus_cap,
                 'total_energy_consumed_wh': 0.0
             }
 
@@ -1165,10 +1169,23 @@ class Stage2DESTerminalChargingPreemptive:
         self.bus_soc = defaultdict(float)
         self.bus_energy_charged = defaultdict(float)
 
+    def _get_bus_capacity(self, line_id: str) -> float:
+        """Return battery capacity (Wh) for a given line_id.
+        Uses per-line map if available, otherwise falls back to default."""
+        return self.line_battery_capacities_wh.get(line_id, self.battery_capacity_wh)
+
+    def _get_capacity_for_bus(self, bus_id: str) -> float:
+        """Return battery capacity (Wh) for a given bus_id."""
+        try:
+            line_id = bus_id.split('_')[0].replace('line', '')
+        except Exception:
+            line_id = "unknown"
+        return self._get_bus_capacity(line_id)
+
     def _on_charge(self, bus_id: str, amount_wh: float, duration_s: float):
         """Callback when charging starts"""
         try:
-            cap = self.battery_capacity_wh
+            cap = self._get_capacity_for_bus(bus_id)
             prev = self.bus_soc.get(bus_id, float(cap))
             new = min(float(cap), prev + amount_wh)
             self.bus_soc[bus_id] = new
@@ -1183,7 +1200,11 @@ class Stage2DESTerminalChargingPreemptive:
         print("\n" + "="*70)
         print("STAGE-2: DES TERMINAL CHARGING WITH MAP USAGE TRACKING")
         print("="*70)
-        print(f"Battery capacity: {self.battery_capacity_wh/1000:,.1f} kWh")
+        print(f"Battery capacity (default): {self.battery_capacity_wh/1000:,.1f} kWh")
+        if self.line_battery_capacities_wh:
+            print(f"Per-line battery capacities:")
+            for lid, cap in sorted(self.line_battery_capacities_wh.items()):
+                print(f"  Line {lid}: {cap/1000:,.1f} kWh")
         print(f"Trip-change stops: {len(self.trip_change_stops)}")
         print(f"Available MAPs: {self.num_maps}")
         print(f"MAP battery: {MAP_BATTERY_CAPACITY_WH/1000:.0f} kWh | Min SOC: {MAP_MIN_SOC*100:.0f}% | Self-charge: {MAP_SELF_CHARGE_RATE_WH_S} Wh/s")
@@ -1214,7 +1235,7 @@ class Stage2DESTerminalChargingPreemptive:
         except:
             line_id = "unknown"
 
-        capacity = self.battery_capacity_wh
+        capacity = self._get_bus_capacity(line_id)
         self.bus_soc[bus_id] = capacity
 
         current_time = 0.0
@@ -1383,8 +1404,9 @@ class Stage2DESTerminalChargingPreemptive:
         min_soc_overall = float('inf')
 
         for bus_id, info in self.buses.items():
-            soc_ratio = info['soc_wh'] / self.battery_capacity_wh
-            min_soc_ratio = info['min_soc_wh'] / self.battery_capacity_wh
+            bus_cap = self._get_bus_capacity(info['line_id'])
+            soc_ratio = info['soc_wh'] / bus_cap
+            min_soc_ratio = info['min_soc_wh'] / bus_cap
 
             bus_stats[bus_id] = {
                 'line_id': info['line_id'],
@@ -1402,6 +1424,7 @@ class Stage2DESTerminalChargingPreemptive:
 
         return {
             'battery_capacity_wh': self.battery_capacity_wh,
+            'line_battery_capacities_wh': dict(self.line_battery_capacities_wh),
             'num_maps': self.num_maps,
             'charging_enabled': self.stop_charging_manager.charging_enabled,
             'preemption_threshold': self.preemption_threshold,
@@ -1750,7 +1773,8 @@ def run_terminal_charging_simulation(sim, bus_trips_dict, bus_lines, trip_change
                                     num_maps: int = 1,
                                     optimize_threshold: bool = True,
                                     preemption_threshold: Optional[float] = None,
-                                    simulation_duration_s: float = 86400):
+                                    simulation_duration_s: float = 86400,
+                                    line_battery_capacities_wh: Optional[Dict[str, float]] = None):
     """Execute terminal charging simulation with MAP tracking"""
 
     stage2 = Stage2DESTerminalChargingPreemptive(
@@ -1761,7 +1785,8 @@ def run_terminal_charging_simulation(sim, bus_trips_dict, bus_lines, trip_change
         initial_battery_capacity_wh=battery_capacity_wh,
         num_maps=num_maps,
         optimize_threshold=optimize_threshold,
-        preemption_threshold=preemption_threshold
+        preemption_threshold=preemption_threshold,
+        line_battery_capacities_wh=line_battery_capacities_wh
     )
 
     results = stage2.run_simulation(simulation_duration_s)

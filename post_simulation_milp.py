@@ -5,7 +5,7 @@ Optimizes bus battery capacity per line, MAP battery capacity, and number of MAP
 to minimize total system cost, based on outputs from the DES charging simulation.
 
 Decision Variables:
-    B_l   : Battery capacity (kWh) per bus on line l          (continuous)
+    B_l   : Battery capacity (kWh) per bus on line l          (integer, step 10)
     B_map : MAP battery capacity (kWh)                        (continuous)
     N_map : Number of MAPs                                    (integer)
 
@@ -13,7 +13,7 @@ Objective: Minimize total system cost
     = bus battery cost  (115 $/kWh × capacity × buses per line)
     + MAP battery cost  (115 $/kWh × capacity × number of MAPs)
     + MAP hardware cost (40,000 $ × number of MAPs)
-    + overnight charging cost (0.0005 $/kWh × overnight energy)
+    + overnight charging cost (500 $/kWh × overnight energy)
     + penalty for SOC violations
 
 Constraints:
@@ -27,7 +27,7 @@ from collections import defaultdict
 # COST PARAMETERS
 # ========================
 BATTERY_COST_PER_KWH = 115.0              # $/kWh for bus and MAP batteries
-OVERNIGHT_CHARGE_COST_PER_KWH = 0.0005    # $/kWh for overnight depot charging
+OVERNIGHT_CHARGE_COST_PER_KWH = 500.0      # $/kWh for overnight depot charging
 MAP_HARDWARE_COST = 40000.0               # $ per MAP unit
 BUS_SOC_VIOLATION_PENALTY = 1_000_000.0   # penalty per bus that violates 20% SOC
 MAP_SOC_VIOLATION_PENALTY = 1_000_000.0   # penalty per MAP that violates 10% SOC
@@ -62,16 +62,25 @@ def extract_simulation_data(results, stage2_sim, bus_lines):
     sim_num_maps = results['num_maps']
     bus_stats = results['bus_statistics']
 
+    # Per-line simulation battery capacities (Wh).
+    # If the simulation provided per-line capacities, use them;
+    # otherwise fall back to the single sim_battery_wh for all lines.
+    line_battery_capacities_wh = results.get('line_battery_capacities_wh', {})
+
     # --- per-bus ---
     per_bus = {}
     for bus_id, stats in bus_stats.items():
+        lid = stats['line_id']
+        # Use per-line capacity if available, else fall back to uniform sim value
+        bus_sim_cap_wh = line_battery_capacities_wh.get(lid, sim_battery_wh)
         per_bus[bus_id] = {
-            'line_id': stats['line_id'],
+            'line_id': lid,
             'total_energy_consumed_wh': stats['total_energy_consumed_wh'],
             'energy_charged_wh': stage2_sim.bus_energy_charged.get(bus_id, 0.0),
             'min_soc_wh': stats['min_soc_wh'],
             'min_soc_ratio': stats['min_soc_ratio'],
             'num_trips': len(stage2_sim.bus_trips_dict.get(bus_id, [])),
+            'sim_battery_wh': bus_sim_cap_wh,
         }
 
     # --- per-line aggregation ---
@@ -92,11 +101,14 @@ def extract_simulation_data(results, stage2_sim, bus_lines):
         ld['max_energy_consumed_wh'] = max(ld['max_energy_consumed_wh'],
                                            bdata['total_energy_consumed_wh'])
         ld['total_energy_consumed_wh'] += bdata['total_energy_consumed_wh']
-        deficit = sim_battery_wh - bdata['min_soc_wh']
+        bus_sim_cap = bdata['sim_battery_wh']
+        deficit = bus_sim_cap - bdata['min_soc_wh']
         ld['max_energy_deficit_wh'] = max(ld['max_energy_deficit_wh'], deficit)
         ld['total_energy_charged_wh'] += bdata['energy_charged_wh']
         ld['total_num_trips'] += bdata['num_trips']
         ld['buses'].append(bus_id)
+        # store per-line sim capacity (same for all buses on the line)
+        ld['sim_battery_wh'] = bus_sim_cap
 
     # --- per-MAP ---
     per_map = {}
@@ -201,8 +213,15 @@ def run_milp_optimization(sim_data,
     model.setParam('OutputFlag', 1)
 
     # --- decision variables ---
-    B = {}
+    # Bus battery capacity per line: discrete in steps of 10 kWh.
+    # We introduce an integer helper K_l so that B_l = K_l × 10.
+    K = {}     # integer helper: K_l ∈ {bus_cap_min_kwh/10 .. bus_cap_max_kwh/10}
+    B = {}     # derived continuous: B_l = K_l × 10  (kWh)
+    k_lb = int(bus_cap_min_kwh / 10)
+    k_ub = int(bus_cap_max_kwh / 10)
     for l in line_ids:
+        K[l] = model.addVar(lb=k_lb, ub=k_ub,
+                            vtype=GRB.INTEGER, name=f"K_{l}")
         B[l] = model.addVar(lb=bus_cap_min_kwh, ub=bus_cap_max_kwh,
                             vtype=GRB.CONTINUOUS, name=f"B_{l}")
 
@@ -238,6 +257,12 @@ def run_milp_optimization(sim_data,
     model.update()
 
     # ---------------------------------------------------------------
+    # Link B_l = K_l × 10   (discrete steps of 10 kWh)
+    # ---------------------------------------------------------------
+    for l in line_ids:
+        model.addConstr(B[l] == 10.0 * K[l], name=f"step10_{l}")
+
+    # ---------------------------------------------------------------
     # McCormick envelope for W = N_map × B_map
     # ---------------------------------------------------------------
     NL, NU = 0, max_maps
@@ -261,14 +286,15 @@ def run_milp_optimization(sim_data,
     BIG_M = 1e7
 
     # 1. Bus SOC ≥ 20%  (per bus, with penalty slack)
+    #    deficit(b) = sim_capacity_for_line − min_soc_wh(b)
     #    new_min_soc(b) = B_l·1000 − deficit(b)
-    #    deficit(b)     = sim_capacity − min_soc_wh(b)
     #    require: new_min_soc(b) ≥ 0.20 · B_l·1000  ⟹
     #      (1−0.20)·B_l·1000 ≥ deficit(b) − s_bus(b)
     for bus_id in bus_ids:
         bdata = per_bus[bus_id]
         lid = bdata['line_id']
-        deficit = sim_battery_wh - bdata['min_soc_wh']
+        bus_sim_cap = bdata['sim_battery_wh']
+        deficit = bus_sim_cap - bdata['min_soc_wh']
 
         model.addConstr(
             (1.0 - BUS_MIN_SOC_FRACTION) * B[lid] * 1000
