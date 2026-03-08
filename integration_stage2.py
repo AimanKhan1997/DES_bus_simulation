@@ -1085,7 +1085,8 @@ class Stage2DESTerminalChargingPreemptive:
                  num_maps: int = 1,
                  optimize_threshold: bool = True,
                  preemption_threshold: Optional[float] = None,
-                 line_battery_capacities_wh: Optional[Dict[str, float]] = None):
+                 line_battery_capacities_wh: Optional[Dict[str, float]] = None,
+                 map_battery_capacity_wh: Optional[float] = None):
 
         self.sim = sim
         self.bus_trips_dict = bus_trips_dict
@@ -1095,6 +1096,8 @@ class Stage2DESTerminalChargingPreemptive:
         self.num_maps = num_maps
         # Per-line battery capacities (Wh); falls back to initial_battery_capacity_wh
         self.line_battery_capacities_wh = line_battery_capacities_wh or {}
+        # MAP battery capacity; falls back to module constant
+        self.map_battery_capacity_wh = map_battery_capacity_wh if map_battery_capacity_wh is not None else MAP_BATTERY_CAPACITY_WH
 
         # Initialize MAP tracker
         self.map_tracker = MAPUsageTracker(num_maps)
@@ -1128,7 +1131,7 @@ class Stage2DESTerminalChargingPreemptive:
         self.map_movement_scheduler = MAPMovementScheduler(
             self.env,
             num_maps=num_maps,
-            map_battery_capacity_wh=MAP_BATTERY_CAPACITY_WH,
+            map_battery_capacity_wh=self.map_battery_capacity_wh,
             map_speed_ms=CHARGER_SPEED_MS,
             map_tracker=self.map_tracker
         )
@@ -1207,7 +1210,7 @@ class Stage2DESTerminalChargingPreemptive:
                 print(f"  Line {lid}: {cap/1000:,.1f} kWh")
         print(f"Trip-change stops: {len(self.trip_change_stops)}")
         print(f"Available MAPs: {self.num_maps}")
-        print(f"MAP battery: {MAP_BATTERY_CAPACITY_WH/1000:.0f} kWh | Min SOC: {MAP_MIN_SOC*100:.0f}% | Self-charge: {MAP_SELF_CHARGE_RATE_WH_S} Wh/s")
+        print(f"MAP battery: {self.map_battery_capacity_wh/1000:.0f} kWh | Min SOC: {MAP_MIN_SOC*100:.0f}% | Self-charge: {MAP_SELF_CHARGE_RATE_WH_S} Wh/s")
 
         if self.preemption_threshold is not None:
             print(f"Preemption threshold (OPTIMIZED): {self.preemption_threshold*100:.1f}% SOC")
@@ -1774,7 +1777,8 @@ def run_terminal_charging_simulation(sim, bus_trips_dict, bus_lines, trip_change
                                     optimize_threshold: bool = True,
                                     preemption_threshold: Optional[float] = None,
                                     simulation_duration_s: float = 86400,
-                                    line_battery_capacities_wh: Optional[Dict[str, float]] = None):
+                                    line_battery_capacities_wh: Optional[Dict[str, float]] = None,
+                                    map_battery_capacity_wh: Optional[float] = None):
     """Execute terminal charging simulation with MAP tracking"""
 
     stage2 = Stage2DESTerminalChargingPreemptive(
@@ -1786,7 +1790,8 @@ def run_terminal_charging_simulation(sim, bus_trips_dict, bus_lines, trip_change
         num_maps=num_maps,
         optimize_threshold=optimize_threshold,
         preemption_threshold=preemption_threshold,
-        line_battery_capacities_wh=line_battery_capacities_wh
+        line_battery_capacities_wh=line_battery_capacities_wh,
+        map_battery_capacity_wh=map_battery_capacity_wh
     )
 
     results = stage2.run_simulation(simulation_duration_s)

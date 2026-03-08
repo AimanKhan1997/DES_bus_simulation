@@ -6,7 +6,7 @@ to minimize total system cost, based on outputs from the DES charging simulation
 
 Decision Variables:
     B_l   : Battery capacity (kWh) per bus on line l          (integer, step 10)
-    B_map : MAP battery capacity (kWh)                        (continuous)
+    B_map : MAP battery capacity (kWh)                        (integer, step 10)
     N_map : Number of MAPs                                    (integer)
 
 Objective: Minimize total system cost
@@ -19,6 +19,7 @@ Objective: Minimize total system cost
 Constraints:
     - No bus may go below 20% SOC (with penalty slack)
     - No MAP may go below 10% SOC (with penalty slack)
+    - MAP self-charging energy is accounted for in the overnight energy balance
 """
 
 from collections import defaultdict
@@ -61,6 +62,9 @@ def extract_simulation_data(results, stage2_sim, bus_lines):
     sim_battery_wh = results['battery_capacity_wh']
     sim_num_maps = results['num_maps']
     bus_stats = results['bus_statistics']
+
+    # Use the MAP battery capacity from the simulation object if available
+    actual_map_cap_wh = getattr(stage2_sim, 'map_battery_capacity_wh', MAP_BATTERY_CAPACITY_WH)
 
     # Per-line simulation battery capacities (Wh).
     # If the simulation provided per-line capacities, use them;
@@ -112,16 +116,28 @@ def extract_simulation_data(results, stage2_sim, bus_lines):
 
     # --- per-MAP ---
     per_map = {}
-    sim_map_battery_wh = MAP_BATTERY_CAPACITY_WH
+    sim_map_battery_wh = actual_map_cap_wh
+    total_map_self_charge_wh = 0.0
 
     if sim_num_maps > 0:
         for map_id in range(sim_num_maps):
             total_delivered = stage2_sim.map_tracker.map_total_energy.get(map_id, 0.0)
             soc_history = stage2_sim.map_tracker.map_soc_history.get(map_id, [])
             min_soc = min((s for _, s in soc_history), default=sim_map_battery_wh)
+
+            # Calculate self-charge energy from SOC history:
+            # Whenever SOC increases between consecutive entries, that is self-charging
+            map_self_charge = 0.0
+            for i in range(1, len(soc_history)):
+                delta = soc_history[i][1] - soc_history[i - 1][1]
+                if delta > 0:
+                    map_self_charge += delta
+            total_map_self_charge_wh += map_self_charge
+
             per_map[map_id] = {
                 'total_energy_delivered_wh': total_delivered,
                 'min_soc_wh': min_soc,
+                'self_charge_energy_wh': map_self_charge,
             }
 
     # --- system totals ---
@@ -138,6 +154,7 @@ def extract_simulation_data(results, stage2_sim, bus_lines):
             'sim_map_battery_wh': sim_map_battery_wh,
             'total_energy_consumed_wh': total_energy_consumed,
             'total_energy_charged_wh': total_energy_charged,
+            'total_map_self_charge_wh': total_map_self_charge_wh,
             'num_buses': results['num_buses'],
         },
     }
@@ -152,7 +169,8 @@ def run_milp_optimization(sim_data,
                           bus_cap_min_kwh=50.0,
                           bus_cap_max_kwh=500.0,
                           map_cap_min_kwh=50.0,
-                          map_cap_max_kwh=500.0):
+                          map_cap_max_kwh=500.0,
+                          feedback_constraints=None):
     """
     Formulate and solve the post-simulation MILP using Gurobi.
 
@@ -166,6 +184,12 @@ def run_milp_optimization(sim_data,
         Lower / upper bounds for bus battery capacity (kWh).
     map_cap_min_kwh, map_cap_max_kwh : float
         Lower / upper bounds for MAP battery capacity (kWh).
+    feedback_constraints : list[dict], optional
+        List of constraint dicts from the MILP–simulation feedback loop.
+        Each dict has keys:
+            'type'    – one of 'bus_min_cap', 'map_min_cap', 'min_maps'
+            'line_id' – (for bus_min_cap) which line to constrain
+            'value'   – the minimum value to enforce
 
     Returns
     -------
@@ -184,6 +208,7 @@ def run_milp_optimization(sim_data,
     sim_map_battery_wh = sys_data['sim_map_battery_wh']
     total_energy_consumed = sys_data['total_energy_consumed_wh']
     total_energy_charged = sys_data['total_energy_charged_wh']
+    total_map_self_charge = sys_data.get('total_map_self_charge_wh', 0.0)
 
     line_ids = sorted(per_line.keys())
     bus_ids = sorted(per_bus.keys())
@@ -206,6 +231,13 @@ def run_milp_optimization(sim_data,
     else:
         scaling_factor = 0.0
 
+    # Self-charge scaling factor: relates self-charge energy to MAP sizing
+    if sim_num_maps > 0 and sim_map_battery_wh > 0:
+        self_charge_scaling = (total_map_self_charge
+                               / (sim_num_maps * sim_map_battery_wh))
+    else:
+        self_charge_scaling = 0.0
+
     # ---------------------------------------------------------------
     # Model
     # ---------------------------------------------------------------
@@ -227,6 +259,11 @@ def run_milp_optimization(sim_data,
         B[l] = model.addVar(lb=bus_cap_min_kwh, ub=bus_cap_max_kwh,
                             vtype=GRB.CONTINUOUS, name=f"B_{l}")
 
+    # MAP battery capacity: discrete in steps of 10 kWh (K_map × 10).
+    k_map_lb = math.ceil(map_cap_min_kwh / 10)
+    k_map_ub = math.floor(map_cap_max_kwh / 10)
+    K_map = model.addVar(lb=k_map_lb, ub=k_map_ub,
+                         vtype=GRB.INTEGER, name="K_map")
     B_map = model.addVar(lb=map_cap_min_kwh, ub=map_cap_max_kwh,
                          vtype=GRB.CONTINUOUS, name="B_map")
 
@@ -263,6 +300,9 @@ def run_milp_optimization(sim_data,
     # ---------------------------------------------------------------
     for l in line_ids:
         model.addConstr(B[l] == 10.0 * K[l], name=f"step10_{l}")
+
+    # Link B_map = K_map × 10  (discrete steps of 10 kWh)
+    model.addConstr(B_map == 10.0 * K_map, name="step10_map")
 
     # ---------------------------------------------------------------
     # McCormick envelope for W = N_map × B_map
@@ -325,9 +365,38 @@ def run_milp_optimization(sim_data,
     model.addConstr(E_charged_scaled <= total_energy_consumed,
                     name="charged_cap")
 
-    # 4. Overnight energy = consumed − charged  (Wh, ≥ 0)
-    model.addConstr(E_overnight >= total_energy_consumed - E_charged_scaled,
+    # 4. Scaled self-charge energy supplied to MAPs during operation
+    #    E_self_charge_scaled = self_charge_scaling × W × 1000   (Wh)
+    E_self_charge_scaled = model.addVar(lb=0.0, vtype=GRB.CONTINUOUS,
+                                        name="E_self_charge_scaled")
+    model.addConstr(E_self_charge_scaled == self_charge_scaling * W * 1000,
+                    name="self_charge_scaling")
+
+    # 5. Overnight energy = consumed − charged + self_charge  (Wh, ≥ 0)
+    #    The MAPs are recharged from the grid during operation (self-charging).
+    #    This energy must also be supplied overnight / from the grid.
+    model.addConstr(E_overnight >= total_energy_consumed - E_charged_scaled
+                    + E_self_charge_scaled,
                     name="overnight_energy")
+
+    # ---------------------------------------------------------------
+    # Feedback constraints from MILP–simulation loop
+    # ---------------------------------------------------------------
+    if feedback_constraints:
+        for i, fc in enumerate(feedback_constraints):
+            fc_type = fc.get('type', '')
+            fc_val = fc.get('value', 0)
+            if fc_type == 'bus_min_cap':
+                lid = fc.get('line_id', '')
+                if lid in B:
+                    model.addConstr(B[lid] >= fc_val,
+                                    name=f"fb_bus_min_{lid}_{i}")
+            elif fc_type == 'map_min_cap':
+                model.addConstr(B_map >= fc_val,
+                                name=f"fb_map_min_{i}")
+            elif fc_type == 'min_maps':
+                model.addConstr(N_map >= fc_val,
+                                name=f"fb_min_maps_{i}")
 
     # ---------------------------------------------------------------
     # Objective
@@ -413,7 +482,8 @@ def post_simulation_optimize(results, stage2_sim, bus_lines,
                              bus_cap_min_kwh=50.0,
                              bus_cap_max_kwh=500.0,
                              map_cap_min_kwh=50.0,
-                             map_cap_max_kwh=500.0):
+                             map_cap_max_kwh=500.0,
+                             feedback_constraints=None):
     """
     Run the post-simulation MILP optimisation.
 
@@ -431,6 +501,8 @@ def post_simulation_optimize(results, stage2_sim, bus_lines,
         Bounds on bus battery capacity.
     map_cap_min_kwh, map_cap_max_kwh : float
         Bounds on MAP battery capacity.
+    feedback_constraints : list[dict], optional
+        Extra constraints from the MILP–simulation feedback loop.
 
     Returns
     -------
@@ -463,6 +535,8 @@ def post_simulation_optimize(results, stage2_sim, bus_lines,
           f"{sim_data['system']['total_energy_consumed_wh'] / 1e6:.3f} MWh")
     print(f"  Total energy charged:   "
           f"{sim_data['system']['total_energy_charged_wh'] / 1e6:.3f} MWh")
+    print(f"  MAP self-charge energy: "
+          f"{sim_data['system']['total_map_self_charge_wh'] / 1e6:.3f} MWh")
     print(f"  Number of buses:        "
           f"{sim_data['system']['num_buses']}")
 
@@ -478,7 +552,8 @@ def post_simulation_optimize(results, stage2_sim, bus_lines,
         for mid, mdata in sorted(sim_data['per_map'].items()):
             print(f"  MAP {mid}: delivered "
                   f"{mdata['total_energy_delivered_wh'] / 1000:.1f} kWh, "
-                  f"min SOC {mdata['min_soc_wh'] / 1000:.1f} kWh")
+                  f"min SOC {mdata['min_soc_wh'] / 1000:.1f} kWh, "
+                  f"self-charge {mdata['self_charge_energy_wh'] / 1000:.1f} kWh")
 
     # --- solve ---
     opt_results = run_milp_optimization(
@@ -488,6 +563,7 @@ def post_simulation_optimize(results, stage2_sim, bus_lines,
         bus_cap_max_kwh=bus_cap_max_kwh,
         map_cap_min_kwh=map_cap_min_kwh,
         map_cap_max_kwh=map_cap_max_kwh,
+        feedback_constraints=feedback_constraints,
     )
 
     # --- report ---
