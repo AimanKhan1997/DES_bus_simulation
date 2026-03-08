@@ -81,7 +81,7 @@ def compute_trip_change_stops(sim, bus_trips_dict):
 
 def diagnose_infeasibility(results, bus_stats):
     """
-    Analyse simulation results to determine why the scenario was infeasible.
+    Analyze simulation results to determine why the scenario was infeasible.
 
     Returns a list of feedback constraint dicts that should be added to the
     MILP on the next iteration.  Each dict has:

@@ -260,11 +260,12 @@ def run_milp_optimization(sim_data,
                             vtype=GRB.CONTINUOUS, name=f"B_{l}")
 
     # MAP battery capacity: discrete in steps of 10 kWh (K_map × 10).
+    # Like bus batteries, we use an integer helper K_map and link B_map = K_map × 10.
     k_map_lb = math.ceil(map_cap_min_kwh / 10)
     k_map_ub = math.floor(map_cap_max_kwh / 10)
     K_map = model.addVar(lb=k_map_lb, ub=k_map_ub,
                          vtype=GRB.INTEGER, name="K_map")
-    B_map = model.addVar(lb=map_cap_min_kwh, ub=map_cap_max_kwh,
+    B_map = model.addVar(lb=k_map_lb * 10, ub=k_map_ub * 10,
                          vtype=GRB.CONTINUOUS, name="B_map")
 
     N_map = model.addVar(lb=0, ub=max_maps, vtype=GRB.INTEGER, name="N_map")
@@ -373,8 +374,9 @@ def run_milp_optimization(sim_data,
                     name="self_charge_scaling")
 
     # 5. Overnight energy = consumed − charged + self_charge  (Wh, ≥ 0)
-    #    The MAPs are recharged from the grid during operation (self-charging).
-    #    This energy must also be supplied overnight / from the grid.
+    #    Self-charge energy represents grid power consumed during daytime
+    #    operations to recharge MAPs.  This is added to the total grid energy
+    #    requirement alongside the overnight depot charging.
     model.addConstr(E_overnight >= total_energy_consumed - E_charged_scaled
                     + E_self_charge_scaled,
                     name="overnight_energy")
