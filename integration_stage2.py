@@ -462,9 +462,10 @@ class ChargingPolicy:
         self.rate_wh_per_s = float(rate_wh_per_s)
 
     def wants_charge(self, soc_wh: float, capacity_wh: float) -> bool:
+        """Allow partial recharge: any bus below stop_pct (80%) can charge."""
         if capacity_wh is None or capacity_wh <= 0:
             return False
-        return soc_wh < (self.start_pct * capacity_wh)
+        return soc_wh < (self.stop_pct * capacity_wh)
 
     def max_target_wh(self, capacity_wh: float) -> float:
         return self.stop_pct * capacity_wh
@@ -525,6 +526,7 @@ class PreemptiveStopChargingManager:
         self._global_active_count = 0  # Track total buses charging across all stops
         self._buses_currently_charging = set()  # Track which buses are actively charging
         self._map_locations = {}  # Track MAP locations {map_id: stop_id}
+        self._line_charge_counts = defaultdict(int)  # Per-line charging counts for fairness
 
     def _can_start(self, stop_id: str) -> bool:
         if not self.charging_enabled:
@@ -542,15 +544,67 @@ class PreemptiveStopChargingManager:
                 return False
         return True
 
-    def _get_next_map_id(self) -> int:
-        """Get next available MAP (round-robin, skipping unavailable ones)"""
+    def _get_next_map_id(self, bus_id=None, stop_id=None) -> int:
+        """Greedy MAP selection based on distance, energy, and line fairness.
+
+        Considers:
+        - MAP availability (not self-charging, has energy)
+        - Distance from MAP to bus stop (closer is better)
+        - MAP remaining energy (more energy is better)
+        - Line fairness (underserved lines get priority)
+        Falls back to round-robin if no MAP scores positively.
+        """
         if self.map_movement_scheduler:
+            # Extract line_id from bus_id (e.g. 'line1_bus_0' → '1')
+            line_id = "unknown"
+            if bus_id:
+                try:
+                    line_id = bus_id.split('_')[0].replace('line', '')
+                except Exception:
+                    pass
+
+            best_map = None
+            best_score = -1.0
+
+            for mid in range(self.num_maps):
+                if not self.map_movement_scheduler.is_map_available(mid):
+                    continue
+
+                avail = self.map_movement_scheduler.available_energy_wh(mid)
+                if avail <= 0:
+                    continue
+
+                # Distance score (prefer closer MAPs)
+                dist_score = 1.0
+                if stop_id:
+                    map_loc = self.map_movement_scheduler.get_map_location(mid)
+                    if map_loc:
+                        dist_m, _ = self.map_movement_scheduler.calculate_travel_time(
+                            map_loc, stop_id)
+                        dist_score = 1.0 / (1.0 + dist_m / 1000.0)
+
+                # Energy score (prefer MAPs with more energy)
+                cap = self.map_movement_scheduler.map_states[mid].battery_capacity_wh
+                energy_score = avail / cap if cap > 0 else 0.0
+
+                # Line fairness score (boost underserved lines)
+                line_count = self._line_charge_counts.get(line_id, 0)
+                fairness_score = 1.0 / (1.0 + line_count)
+
+                score = dist_score * energy_score * fairness_score
+                if score > best_score:
+                    best_score = score
+                    best_map = mid
+
+            if best_map is not None:
+                return best_map
+
+            # Fallback: round-robin if no MAP scored positively
             for _ in range(self.num_maps):
                 map_id = self._current_map_id % self.num_maps
                 self._current_map_id += 1
                 if self.map_movement_scheduler.is_map_available(map_id):
                     return map_id
-            # No available MAP found – return round-robin anyway (will be caught later)
             map_id = self._current_map_id % self.num_maps
             self._current_map_id += 1
             return map_id
@@ -573,8 +627,13 @@ class PreemptiveStopChargingManager:
         if bus_id in self._buses_currently_charging:
             return (False, 0.0, 0.0)
 
-        # Assign MAP first so we can check its energy
-        map_id = self._get_next_map_id()
+        # Use preferred MAP if provided and available, else greedy selection
+        preferred = req.get("preferred_map_id")
+        if (preferred is not None and self.map_movement_scheduler
+                and self.map_movement_scheduler.is_map_available(preferred)):
+            map_id = preferred
+        else:
+            map_id = self._get_next_map_id(bus_id=bus_id, stop_id=stop_id)
 
         amount = self.policy.charge_amount_for_duration(soc, cap, desired)
         if amount <= 0 or desired <= 0:
@@ -617,6 +676,13 @@ class PreemptiveStopChargingManager:
             "map_id": map_id
         }
         self._charging_events.append(charging_event)
+
+        # Track per-line charging counts for fairness
+        try:
+            _line_id = bus_id.split('_')[0].replace('line', '')
+        except Exception:
+            _line_id = "unknown"
+        self._line_charge_counts[_line_id] += 1
 
         if callable(self.on_charge):
             try:
@@ -726,7 +792,8 @@ class PreemptiveStopChargingManager:
             self._start_session(stop_id, req)
 
     def request_stop_charging(self, stop_id: str, bus_id: str, soc_wh: float,
-                             capacity_wh: float, desired_duration_s: float):
+                             capacity_wh: float, desired_duration_s: float,
+                             preferred_map_id: int = None):
         """Request charging"""
 
         if not self.charging_enabled:
@@ -743,7 +810,8 @@ class PreemptiveStopChargingManager:
             "soc": soc_wh,
             "capacity": capacity_wh,
             "desired": desired_duration_s,
-            "requested_time": float(self.env.now)
+            "requested_time": float(self.env.now),
+            "preferred_map_id": preferred_map_id
         }
 
         soc_ratio = soc_wh / capacity_wh if capacity_wh > 0 else 0
@@ -1197,6 +1265,61 @@ class Stage2DESTerminalChargingPreemptive:
         except Exception:
             pass
 
+    def _select_best_map(self, bus_id: str, line_id: str, stop_id: str,
+                         soc_wh: float, capacity_wh: float) -> Optional[int]:
+        """Greedy heuristic: select the best available MAP for a bus.
+
+        Scoring considers:
+        - MAP availability (not self-charging, has energy above 10%)
+        - Distance from MAP to bus stop (closer is better)
+        - MAP remaining energy (more energy is better)
+        - Line fairness (underserved lines get priority)
+        - Bus SOC urgency (lower SOC = higher priority)
+
+        Returns map_id or None if no MAP is available.
+        """
+        if self.num_maps <= 0:
+            return None
+
+        best_map = None
+        best_score = -1.0
+
+        # Get line charge counts from the charging manager for fairness
+        line_counts = self.stop_charging_manager._line_charge_counts
+
+        for map_id in range(self.num_maps):
+            if not self.map_movement_scheduler.is_map_available(map_id):
+                continue
+
+            avail = self.map_movement_scheduler.available_energy_wh(map_id)
+            if avail <= 0:
+                continue
+
+            # Distance score (prefer closer MAPs; 1.0 when at same location)
+            map_loc = self.map_movement_scheduler.get_map_location(map_id)
+            dist_m, _ = self.map_movement_scheduler.calculate_travel_time(
+                map_loc or "depot", stop_id)
+            distance_score = 1.0 / (1.0 + dist_m / 1000.0)
+
+            # Energy score (prefer MAPs with more available energy)
+            cap_map = self.map_movement_scheduler.map_states[map_id].battery_capacity_wh
+            energy_score = avail / cap_map if cap_map > 0 else 0.0
+
+            # Line fairness score (boost lines that have been charged less)
+            line_count = line_counts.get(line_id, 0)
+            fairness_score = 1.0 / (1.0 + line_count)
+
+            # Bus urgency (lower SOC → higher urgency)
+            soc_ratio = soc_wh / capacity_wh if capacity_wh > 0 else 1.0
+            urgency = max(0.01, 1.0 - soc_ratio)
+
+            score = distance_score * energy_score * fairness_score * urgency
+            if score > best_score:
+                best_score = score
+                best_map = map_id
+
+        return best_map
+
     def run_simulation(self, duration_s: float = 86400) -> Dict:
         """Run DES simulation"""
 
@@ -1293,11 +1416,13 @@ class Stage2DESTerminalChargingPreemptive:
                             soc_at_departure_wh=soc_now
                         )
 
-                        # Check if bus needs charging and assign MAP if available
-                        if self.stop_charging_manager.charging_enabled and soc_now < 0.7 * capacity:
-                            # Request MAP movement to this location
-                            map_id = 0  # Start with first available MAP
-                            if map_id < self.num_maps:
+                        # Greedy MAP assignment: charge any bus below 80% SOC
+                        if self.stop_charging_manager.charging_enabled and soc_now < BUS_CHARGE_CUTOFF_SOC * capacity:
+                            # Greedy heuristic selects best MAP (by distance, energy, line fairness, urgency)
+                            map_id = self._select_best_map(bus_id, line_id, start_stop_id, soc_now, capacity)
+
+                            if map_id is not None:
+                                # Move MAP to this location
                                 travel_time_distance = self.map_movement_scheduler.assign_map_to_bus(
                                     map_id=map_id,
                                     bus_id=bus_id,
@@ -1307,42 +1432,25 @@ class Stage2DESTerminalChargingPreemptive:
 
                                 if travel_time_distance:
                                     travel_time_s, distance_m = travel_time_distance
-                                    # Wait for MAP to arrive, then request charging
-                                    yield self.env.timeout(travel_time_s)
+                                    if travel_time_s > 0:
+                                        yield self.env.timeout(travel_time_s)
 
-                                    # Now attempt charging
-                                    started, actual_dur, amount = self.stop_charging_manager.request_stop_charging(
-                                        stop_id=start_stop_id,
-                                        bus_id=bus_id,
-                                        soc_wh=soc_now,
-                                        capacity_wh=capacity,
-                                        desired_duration_s=duration - travel_time_s
-                                    )
-
-                                    # Wait for charging to complete
-                                    if started and actual_dur > 0:
-                                        yield self.env.timeout(actual_dur)
+                                    remaining_duration = max(0, duration - travel_time_s)
                                 else:
-                                    # MAP already at location
+                                    remaining_duration = duration
+
+                                if remaining_duration > 0:
                                     started, actual_dur, amount = self.stop_charging_manager.request_stop_charging(
                                         stop_id=start_stop_id,
                                         bus_id=bus_id,
                                         soc_wh=soc_now,
                                         capacity_wh=capacity,
-                                        desired_duration_s=duration
+                                        desired_duration_s=remaining_duration,
+                                        preferred_map_id=map_id
                                     )
 
                                     if started and actual_dur > 0:
                                         yield self.env.timeout(actual_dur)
-                        else:
-                            # Normal charging request without MAP movement
-                            started, actual_dur, amount = self.stop_charging_manager.request_stop_charging(
-                                stop_id=start_stop_id,
-                                bus_id=bus_id,
-                                soc_wh=soc_now,
-                                capacity_wh=capacity,
-                                desired_duration_s=duration
-                            )
 
                         # Wait for the full layover duration
                         yield self.env.timeout(duration)
