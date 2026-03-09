@@ -462,7 +462,7 @@ class ChargingPolicy:
         self.rate_wh_per_s = float(rate_wh_per_s)
 
     def wants_charge(self, soc_wh: float, capacity_wh: float) -> bool:
-        """Allow partial recharge: any bus below stop_pct (80%) can charge."""
+        """Allow partial recharge: any bus below stop_pct (default 80%) can charge."""
         if capacity_wh is None or capacity_wh <= 0:
             return False
         return soc_wh < (self.stop_pct * capacity_wh)
@@ -907,6 +907,10 @@ class PreemptiveStopChargingManager:
     def get_preemption_events(self):
         return list(self._preemption_events)
 
+    def get_line_charge_counts(self):
+        """Return per-line charging counts (for greedy MAP selection fairness)."""
+        return dict(self._line_charge_counts)
+
 # ========================
 # MAP MOVEMENT SCHEDULER (NEW)
 # ========================
@@ -1285,7 +1289,7 @@ class Stage2DESTerminalChargingPreemptive:
         best_score = -1.0
 
         # Get line charge counts from the charging manager for fairness
-        line_counts = self.stop_charging_manager._line_charge_counts
+        line_counts = self.stop_charging_manager.get_line_charge_counts()
 
         for map_id in range(self.num_maps):
             if not self.map_movement_scheduler.is_map_available(map_id):
@@ -1309,7 +1313,8 @@ class Stage2DESTerminalChargingPreemptive:
             line_count = line_counts.get(line_id, 0)
             fairness_score = 1.0 / (1.0 + line_count)
 
-            # Bus urgency (lower SOC → higher urgency)
+            # Bus urgency (lower SOC → higher urgency).
+            # Floor at 0.01 to prevent zero score for fully charged buses.
             soc_ratio = soc_wh / capacity_wh if capacity_wh > 0 else 1.0
             urgency = max(0.01, 1.0 - soc_ratio)
 
@@ -1416,7 +1421,7 @@ class Stage2DESTerminalChargingPreemptive:
                             soc_at_departure_wh=soc_now
                         )
 
-                        # Greedy MAP assignment: charge any bus below 80% SOC
+                        # Greedy MAP assignment: charge any bus below BUS_CHARGE_CUTOFF_SOC
                         if self.stop_charging_manager.charging_enabled and soc_now < BUS_CHARGE_CUTOFF_SOC * capacity:
                             # Greedy heuristic selects best MAP (by distance, energy, line fairness, urgency)
                             map_id = self._select_best_map(bus_id, line_id, start_stop_id, soc_now, capacity)
