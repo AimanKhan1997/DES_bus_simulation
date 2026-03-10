@@ -196,7 +196,7 @@ def run_milp_simulation_loop(sim, bus_trips, bus_lines, trip_change_stops,
 
     # --- Feedback iterations ---
     for iteration in range(1, max_iterations + 1):
-        if milp_results.get('objective_value') is None:
+        if milp_results is None or milp_results.get('objective_value') is None:
             print(f"\n⚠  MILP returned no solution – stopping loop.")
             break
 
@@ -286,10 +286,14 @@ def run_milp_simulation_loop(sim, bus_trips, bus_lines, trip_change_stops,
             })
 
             # Re-run MILP with tighter cost bound
-            milp_results = post_simulation_optimize(
-                results, stage2_sim, bus_lines,
-                feedback_constraints=feedback_constraints,
-            )
+            try:
+                milp_results = post_simulation_optimize(
+                    results, stage2_sim, bus_lines,
+                    feedback_constraints=feedback_constraints,
+                )
+            except Exception as e:
+                print(f"\n⚠  MILP error during cost-bound search: {e}")
+                milp_results = None
 
             # If MILP can't find anything cheaper, we've found the optimum
             if (milp_results is None
@@ -311,10 +315,14 @@ def run_milp_simulation_loop(sim, bus_trips, bus_lines, trip_change_stops,
             feedback_constraints.append(fc)
 
         # Re-run MILP with updated constraints
-        milp_results = post_simulation_optimize(
-            results, stage2_sim, bus_lines,
-            feedback_constraints=feedback_constraints,
-        )
+        try:
+            milp_results = post_simulation_optimize(
+                results, stage2_sim, bus_lines,
+                feedback_constraints=feedback_constraints,
+            )
+        except Exception as e:
+            print(f"\n⚠  MILP error with feedback constraints: {e}")
+            milp_results = None
 
         iteration_log.append({
             'iteration': iteration,
