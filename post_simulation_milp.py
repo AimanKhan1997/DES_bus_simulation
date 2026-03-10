@@ -414,15 +414,21 @@ def run_milp_optimization(sim_data,
         v_bus[b] for b in bus_ids)
     map_penalty = MAP_SOC_VIOLATION_PENALTY * v_map
 
-    model.setObjective(
-        bus_battery_cost
-        + map_battery_cost
-        + map_hardware_cost
-        + overnight_cost
-        + bus_penalty
-        + map_penalty,
-        GRB.MINIMIZE,
-    )
+    total_cost_expr = (bus_battery_cost
+                       + map_battery_cost
+                       + map_hardware_cost
+                       + overnight_cost
+                       + bus_penalty
+                       + map_penalty)
+
+    model.setObjective(total_cost_expr, GRB.MINIMIZE)
+
+    # Cost upper-bound constraint (from feedback loop to find cheaper solutions)
+    if feedback_constraints:
+        for i, fc in enumerate(feedback_constraints):
+            if fc.get('type') == 'cost_upper_bound':
+                model.addConstr(total_cost_expr <= fc['value'],
+                                name=f"fb_cost_ub_{i}")
 
     # ---------------------------------------------------------------
     # Solve
