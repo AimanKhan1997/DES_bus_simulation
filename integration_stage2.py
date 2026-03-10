@@ -1397,13 +1397,13 @@ class Stage2DESTerminalChargingPreemptive:
                 except Exception:
                     start_node = None
 
-                if (prev_end_node is not None and start_node is not None and
-                    prev_end_node == start_node and prev_end_time is not None):
+                if (prev_end_node is not None and start_node is not None and prev_end_time is not None):#and
+                    prev_end_node == start_node
 
                     duration = trip_start - prev_end_time
                     start_stop_id = seq[0].get("stop_id")
 
-                    if duration > 0 and start_stop_id in self.trip_change_stops:
+                    if duration > 0:# and start_stop_id in self.trip_change_stops:
                         soc_now = self.bus_soc.get(bus_id, capacity)
 
                         next_trip_id = trip_ids[trip_idx + 1] if trip_idx + 1 < len(trip_ids) else None
