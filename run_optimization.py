@@ -348,9 +348,9 @@ def run_milp_simulation_loop(sim, bus_trips, bus_lines, trip_change_stops,
     print("-" * 65)
     for entry in iteration_log:
         feas = "✓" if entry.get('sim_feasible') else "✗"
-        obj = f"${entry['objective']:,.0f}" if entry.get('objective') else "N/A"
-        maps = entry.get('num_maps', '-')
-        map_kwh = f"{entry['map_battery_kwh']:.0f}" if entry.get('map_battery_kwh') else '-'
+        obj = f"${entry['objective']:,.0f}" if entry.get('objective') is not None else "N/A"
+        maps = str(entry.get('num_maps', '-')) if entry.get('num_maps') is not None else '-'
+        map_kwh = f"{entry['map_battery_kwh']:.0f}" if entry.get('map_battery_kwh') is not None else '-'
         best_mark = " ◀ BEST" if (best_feasible
                                    and entry.get('sim_feasible')
                                    and entry.get('iteration') == best_feasible['iteration']) else ""
