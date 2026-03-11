@@ -181,7 +181,7 @@ def run_milp_simulation_loop(sim, bus_trips, bus_lines, trip_change_stops,
     )
 
     if milp_results is None:
-        print("MILP solver not available – cannot run feedback loop.")
+        print("MILP solver not available - cannot run feedback loop.")
         return None, results, stage2_sim, []
 
     iteration_log.append({
@@ -197,7 +197,7 @@ def run_milp_simulation_loop(sim, bus_trips, bus_lines, trip_change_stops,
     # --- Feedback iterations ---
     for iteration in range(1, max_iterations + 1):
         if milp_results is None or milp_results.get('objective_value') is None:
-            print(f"\n⚠  MILP returned no solution – stopping loop.")
+            print(f"\n[!] MILP returned no solution - stopping loop.")
             break
 
         # Extract MILP-recommended values
@@ -237,7 +237,7 @@ def run_milp_simulation_loop(sim, bus_trips, bus_lines, trip_change_stops,
             map_battery_capacity_wh=milp_map_cap_wh,
         )
 
-        print(f"\n  Simulation feasibility: {'FEASIBLE ✓' if results['feasible'] else 'INFEASIBLE ✗'}")
+        print(f"\n  Simulation feasibility: {'FEASIBLE [OK]' if results['feasible'] else 'INFEASIBLE [X]'}")
         print(f"  Min SOC ratio: {results['min_soc_overall_ratio']*100:.1f}%")
 
         if results['feasible']:
@@ -246,7 +246,7 @@ def run_milp_simulation_loop(sim, bus_trips, bus_lines, trip_change_stops,
                         if best_feasible else None)
 
             if best_obj is None or current_obj < best_obj:
-                print(f"\n✓ NEW BEST feasible solution at iteration {iteration}!"
+                print(f"\n[OK] NEW BEST feasible solution at iteration {iteration}!"
                       f"  Cost: ${current_obj:,.0f}"
                       + (f" (prev best: ${best_obj:,.0f})" if best_obj else ""))
                 best_feasible = {
@@ -257,7 +257,7 @@ def run_milp_simulation_loop(sim, bus_trips, bus_lines, trip_change_stops,
                 }
             else:
                 print(f"\n  Feasible but not cheaper (${current_obj:,.0f}"
-                      f" ≥ best ${best_obj:,.0f}).")
+                      f" >= best ${best_obj:,.0f}).")
 
             iteration_log.append({
                 'iteration': iteration,
@@ -292,13 +292,13 @@ def run_milp_simulation_loop(sim, bus_trips, bus_lines, trip_change_stops,
                     feedback_constraints=feedback_constraints,
                 )
             except Exception as e:
-                print(f"\n⚠  MILP error during cost-bound search: {e}")
+                print(f"\n[!] MILP error during cost-bound search: {e}")
                 milp_results = None
 
             # If MILP can't find anything cheaper, we've found the optimum
             if (milp_results is None
                     or milp_results.get('objective_value') is None):
-                print(f"\n✓ MILP cannot find a cheaper solution – "
+                print(f"\n[OK] MILP cannot find a cheaper solution - "
                       f"current best is optimal.")
                 break
 
@@ -307,7 +307,7 @@ def run_milp_simulation_loop(sim, bus_trips, bus_lines, trip_change_stops,
         # --- Infeasible: diagnose and add constraints ---
         new_constraints = diagnose_infeasibility(results, results['bus_statistics'])
         if not new_constraints:
-            print("  Could not diagnose infeasibility – stopping loop.")
+            print("  Could not diagnose infeasibility - stopping loop.")
             break
 
         for fc in new_constraints:
@@ -321,7 +321,7 @@ def run_milp_simulation_loop(sim, bus_trips, bus_lines, trip_change_stops,
                 feedback_constraints=feedback_constraints,
             )
         except Exception as e:
-            print(f"\n⚠  MILP error with feedback constraints: {e}")
+            print(f"\n[!] MILP error with feedback constraints: {e}")
             milp_results = None
 
         iteration_log.append({
@@ -336,7 +336,7 @@ def run_milp_simulation_loop(sim, bus_trips, bus_lines, trip_change_stops,
         })
 
     else:
-        print(f"\n⚠  Max iterations ({max_iterations}) reached."
+        print(f"\n[!] Max iterations ({max_iterations}) reached."
               + (" Best feasible solution retained."
                  if best_feasible else " No feasible solution found."))
 
@@ -347,11 +347,11 @@ def run_milp_simulation_loop(sim, bus_trips, bus_lines, trip_change_stops,
     print(f"\n{'Iter':<6} {'Status':<12} {'Feasible':<10} {'Objective':>15} {'MAPs':>6} {'MAP kWh':>9}")
     print("-" * 65)
     for entry in iteration_log:
-        feas = "✓" if entry.get('sim_feasible') else "✗"
+        feas = "Y" if entry.get('sim_feasible') else "N"
         obj = f"${entry['objective']:,.0f}" if entry.get('objective') is not None else "N/A"
         maps = str(entry.get('num_maps', '-')) if entry.get('num_maps') is not None else '-'
         map_kwh = f"{entry['map_battery_kwh']:.0f}" if entry.get('map_battery_kwh') is not None else '-'
-        best_mark = " ◀ BEST" if (best_feasible
+        best_mark = " <-- BEST" if (best_feasible
                                    and entry.get('sim_feasible')
                                    and entry.get('iteration') == best_feasible['iteration']) else ""
         print(f"{entry['iteration']:<6} {entry.get('milp_status',''):<12} {feas:<10} {obj:>15} {maps:>6} {map_kwh:>9}{best_mark}")
@@ -367,7 +367,7 @@ def run_milp_simulation_loop(sim, bus_trips, bus_lines, trip_change_stops,
 def main():
     print("\n" + "="*70)
     print("STAGE-2: TERMINAL CHARGING WITH INTEGRATED OPTIMIZED PREEMPTION")
-    print("  + MILP ↔ SIMULATION FEEDBACK LOOP")
+    print("  + MILP <-> SIMULATION FEEDBACK LOOP")
     print("="*70)
 
     try:
@@ -393,7 +393,7 @@ def main():
         return
 
     print("\n" + "="*70)
-    print("MILP ↔ SIMULATION FEEDBACK LOOP")
+    print("MILP <-> SIMULATION FEEDBACK LOOP")
     print("="*70)
 
     # Per-line battery capacities (kWh)
@@ -436,7 +436,7 @@ def main():
         print("\nBus battery capacities (per line):")
         for lid, cap in sorted(milp_results['bus_battery_kwh'].items()):
             print(f"  Line {lid}: {cap:.0f} kWh")
-        print(f"\nSimulation feasible: {'YES ✓' if sim_results['feasible'] else 'NO ✗'}")
+        print(f"\nSimulation feasible: {'YES' if sim_results['feasible'] else 'NO'}")
         print(f"Min SOC: {sim_results['min_soc_overall_ratio']*100:.1f}%")
     else:
         print("\nNo feasible MILP solution found.")

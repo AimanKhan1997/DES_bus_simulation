@@ -62,6 +62,17 @@ class MAPMovementRecord:
     associated_bus_id: Optional[str] = None
 
 @dataclass
+class MAPSelfChargeRecord:
+    """Record of a MAP self-charge event"""
+    map_id: int
+    start_time_s: float
+    end_time_s: float
+    duration_s: float
+    location: str  # stop_id where self-charging occurred
+    soc_before_wh: float
+    soc_after_wh: float
+
+@dataclass
 class MAPState:
     """Current state of a MAP"""
     map_id: int
@@ -94,6 +105,23 @@ class MAPUsageTracker:
         self.map_movement_events = defaultdict(int)  # {map_id: num_movements}
         # MAP SOC history for plotting {map_id: [(time_s, soc_wh)]}
         self.map_soc_history = defaultdict(list)
+        # Self-charge event tracking
+        self.self_charge_records = []  # List of MAPSelfChargeRecord
+
+    def record_self_charge(self, map_id: int, start_time: float, end_time: float,
+                           location: str, soc_before_wh: float, soc_after_wh: float):
+        """Record a MAP self-charge event"""
+        duration = end_time - start_time
+        record = MAPSelfChargeRecord(
+            map_id=map_id,
+            start_time_s=start_time,
+            end_time_s=end_time,
+            duration_s=duration,
+            location=location,
+            soc_before_wh=soc_before_wh,
+            soc_after_wh=soc_after_wh
+        )
+        self.self_charge_records.append(record)
 
     def record_charge(self, map_id: int, bus_id: str, start_time: float,
                      end_time: float, energy_wh: float, location: str,
@@ -435,7 +463,7 @@ class PreemptionStrategyAnalyzer:
             print("\n" + "="*70)
             print("PREEMPTION STRATEGY ANALYSIS")
             print("="*70)
-            print("\n⚠️  NO MAPs AVAILABLE - CHARGING DISABLED\n")
+            print("\n[!] NO MAPs AVAILABLE - CHARGING DISABLED\n")
             return
 
         print("\n" + "="*70)
@@ -1086,9 +1114,12 @@ class MAPMovementScheduler:
         self._is_self_charging[map_id] = True
         deficit = state.battery_capacity_wh - state.current_soc_wh
         duration = deficit / MAP_SELF_CHARGE_RATE_WH_S
+        soc_before = state.current_soc_wh
+        start_time = float(self.env.now)
+        location = state.current_location
 
         print(f"  [MAP {map_id}] Self-charging started at t={self.env.now:.0f}s "
-              f"(SOC {state.current_soc_wh/1000:.1f} kWh → {state.battery_capacity_wh/1000:.1f} kWh, "
+              f"(SOC {state.current_soc_wh/1000:.1f} kWh -> {state.battery_capacity_wh/1000:.1f} kWh, "
               f"duration {duration:.0f}s)")
 
         yield self.env.timeout(duration)
@@ -1099,6 +1130,14 @@ class MAPMovementScheduler:
         if self.map_tracker:
             self.map_tracker.map_soc_history[map_id].append(
                 (float(self.env.now), state.current_soc_wh))
+            self.map_tracker.record_self_charge(
+                map_id=map_id,
+                start_time=start_time,
+                end_time=float(self.env.now),
+                location=location,
+                soc_before_wh=soc_before,
+                soc_after_wh=state.current_soc_wh
+            )
 
         print(f"  [MAP {map_id}] Self-charging complete at t={self.env.now:.0f}s "
               f"(SOC {state.current_soc_wh/1000:.1f} kWh)")
@@ -1177,7 +1216,7 @@ class Stage2DESTerminalChargingPreemptive:
         if num_maps <= 0:
             self.preemption_threshold = None
             self.threshold_analysis = None
-            print(f"\n⚠️  WARNING: num_maps = {num_maps}")
+            print(f"\n[!] WARNING: num_maps = {num_maps}")
             print(f"  Charging is DISABLED for this simulation\n")
         elif preemption_threshold is not None:
             self.preemption_threshold = preemption_threshold
@@ -1880,6 +1919,99 @@ class Stage2DESTerminalChargingPreemptive:
         print(f"Plot saved to: {save_path}")
         plt.show()
 
+    def plot_map_self_charge_heatmap(self, save_path: str = "map_self_charge_heatmap.png"):
+        """Plot a heatmap of stops where MAPs self-charge.
+
+        Uses the stop coordinates from the MAP movement scheduler and
+        counts the number of self-charge events at each stop to produce
+        a scatter-based heatmap.
+        """
+
+        records = self.map_tracker.self_charge_records
+
+        if not records:
+            print("No MAP self-charge records to plot")
+            return
+
+        stop_locs = self.map_movement_scheduler.stop_locations
+
+        # Count self-charge events per location and collect coordinates
+        location_counts = defaultdict(int)
+        for rec in records:
+            location_counts[rec.location] += 1
+
+        lats = []
+        lons = []
+        counts = []
+        labels = []
+
+        for loc, count in location_counts.items():
+            coords = stop_locs.get(loc)
+            if coords is None:
+                continue
+            lat, lon = coords
+            lats.append(lat)
+            lons.append(lon)
+            counts.append(count)
+            labels.append(loc)
+
+        if not lats:
+            print("No self-charge locations with coordinates found")
+            return
+
+        fig, ax = plt.subplots(figsize=(12, 10))
+
+        sc = ax.scatter(
+            lons, lats,
+            c=counts,
+            s=[max(80, c * 40) for c in counts],
+            cmap='YlOrRd',
+            alpha=0.8,
+            edgecolors='black',
+            linewidths=0.5,
+            zorder=5,
+        )
+
+        cbar = plt.colorbar(sc, ax=ax, shrink=0.8, pad=0.02)
+        cbar.set_label('Number of self-charge events', fontweight='bold', fontsize=11)
+
+        # Annotate stops with high usage
+        max_count = max(counts)
+        for lon, lat, count, label in zip(lons, lats, counts, labels):
+            if count >= max(2, max_count * 0.5):
+                ax.annotate(
+                    f'{label}\n({count})',
+                    (lon, lat),
+                    textcoords="offset points",
+                    xytext=(8, 8),
+                    fontsize=7,
+                    fontweight='bold',
+                    bbox=dict(boxstyle='round,pad=0.2', facecolor='white',
+                              edgecolor='gray', alpha=0.8),
+                )
+
+        ax.set_xlabel('Longitude', fontweight='bold', fontsize=12)
+        ax.set_ylabel('Latitude', fontweight='bold', fontsize=12)
+        ax.set_title('MAP Self-Charge Location Heatmap', fontweight='bold', fontsize=14)
+        ax.grid(True, alpha=0.3)
+
+        total_events = sum(counts)
+        num_locations = len(counts)
+        ax.text(
+            0.02, 0.98,
+            f'Total self-charge events: {total_events}\n'
+            f'Unique locations: {num_locations}',
+            transform=ax.transAxes,
+            fontsize=9,
+            verticalalignment='top',
+            bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.9),
+        )
+
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Plot saved to: {save_path}")
+        plt.show()
+
 # ========================
 # SIMULATION RUNNER
 # ========================
@@ -1940,9 +2072,9 @@ def run_terminal_charging_simulation(sim, bus_trips_dict, bus_lines, trip_change
     print(f"Minimum SOC reached: {results['min_soc_overall_ratio']*100:.1f}%")
 
     if results['feasible']:
-        print(f"✓ FEASIBLE: Min SOC stays above 20%")
+        print(f"[OK] FEASIBLE: Min SOC stays above 20%")
     else:
-        print(f"✗ INFEASIBLE")
+        print(f"[X] INFEASIBLE")
 
     print("\nCHARGING STATISTICS:")
     print("-"*70)
@@ -1958,5 +2090,6 @@ def run_terminal_charging_simulation(sim, bus_trips_dict, bus_lines, trip_change
     stage2.plot_cumulative_energy_delivery(save_path="cumulative_energy_delivery.png")
     stage2.plot_map_movement(save_path="map_movement_distance.png")
     stage2.plot_map_soc(save_path="map_soc_over_time.png")
+    stage2.plot_map_self_charge_heatmap(save_path="map_self_charge_heatmap.png")
 
     return results, stage2
