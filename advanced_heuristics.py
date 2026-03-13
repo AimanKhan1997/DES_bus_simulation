@@ -26,6 +26,24 @@ BUS_MIN_SOC = 0.20
 MAP_MIN_SOC = 0.10
 ENERGY_PER_METER_WH = 2.7
 
+# Default fallback thresholds (used only when capacity data is unavailable)
+DEFAULT_CHARGE_START_PCT = 0.70
+DEFAULT_CHARGE_TARGET_PCT = 0.80
+
+# Priority scoring weights (SOC urgency, energy shortfall, fairness, contention)
+W_URGENCY = 0.40
+W_SHORTFALL = 0.30
+W_FAIRNESS = 0.15
+W_CONTENTION = 0.15
+
+# MAP selection scoring weights (distance, deliverable, energy, fairness, urgency, conservation)
+W_MAP_DISTANCE = 0.25
+W_MAP_DELIVERABLE = 0.25
+W_MAP_ENERGY = 0.20
+W_MAP_FAIRNESS = 0.10
+W_MAP_URGENCY = 0.10
+W_MAP_CONSERVATION = 0.10
+
 
 @dataclass
 class ChargingDecision:
@@ -218,7 +236,7 @@ class AdvancedMAPScheduler:
         """
 
         if capacity_wh <= 0:
-            return (0.7, 0.8)  # Fallback to defaults
+            return (DEFAULT_CHARGE_START_PCT, DEFAULT_CHARGE_TARGET_PCT)
 
         # Trip look-ahead: how many remaining trips?
         remaining_trips = self._remaining_trips(bus_id, current_time_s)
@@ -309,21 +327,16 @@ class AdvancedMAPScheduler:
         # Factor 4: System contention — how many other buses are also low?
         low_soc_buses = sum(
             1 for bid, soc in all_bus_soc.items()
-            if bid != bus_id and soc / capacity_wh < 0.5
+            if bid != bus_id and soc / max(1.0, self._get_bus_capacity(bid)) < 0.5
         )
         # If many buses are low, prioritize the worst-off
         contention_boost = 1.0 + 0.1 * max(0, low_soc_buses - self.num_maps)
 
         # Weighted combination
-        w_urgency = 0.40
-        w_shortfall = 0.30
-        w_fairness = 0.15
-        w_contention = 0.15
-
-        score = (w_urgency * urgency
-                 + w_shortfall * shortfall
-                 + w_fairness * fairness
-                 + w_contention * (contention_boost - 1.0))
+        score = (W_URGENCY * urgency
+                 + W_SHORTFALL * shortfall
+                 + W_FAIRNESS * fairness
+                 + W_CONTENTION * (contention_boost - 1.0))
 
         return score
 
@@ -410,12 +423,12 @@ class AdvancedMAPScheduler:
             if future_ratio < 0.2:
                 conservation_penalty = 0.5 + future_ratio * 2.5  # 0.5-1.0
 
-            score = (0.25 * distance_score
-                     + 0.25 * deliver_score
-                     + 0.20 * energy_score
-                     + 0.10 * fairness_score
-                     + 0.10 * urgency
-                     + 0.10 * conservation_penalty)
+            score = (W_MAP_DISTANCE * distance_score
+                     + W_MAP_DELIVERABLE * deliver_score
+                     + W_MAP_ENERGY * energy_score
+                     + W_MAP_FAIRNESS * fairness_score
+                     + W_MAP_URGENCY * urgency
+                     + W_MAP_CONSERVATION * conservation_penalty)
 
             if score > best_score:
                 best_score = score
