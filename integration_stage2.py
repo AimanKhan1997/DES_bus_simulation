@@ -663,7 +663,16 @@ class PreemptiveStopChargingManager:
         else:
             map_id = self._get_next_map_id(bus_id=bus_id, stop_id=stop_id)
 
-        amount = self.policy.charge_amount_for_duration(soc, cap, desired)
+        # If a custom target SOC was provided (advanced heuristics), use it
+        # instead of the fixed policy target.
+        custom_target = req.get("target_soc_wh")
+        if custom_target is not None:
+            remaining = max(0.0, min(cap, custom_target) - soc)
+            possible = self.policy.rate_wh_per_s * desired
+            amount = min(remaining, possible)
+        else:
+            amount = self.policy.charge_amount_for_duration(soc, cap, desired)
+
         if amount <= 0 or desired <= 0:
             return (False, 0.0, 0.0)
 
@@ -821,8 +830,22 @@ class PreemptiveStopChargingManager:
 
     def request_stop_charging(self, stop_id: str, bus_id: str, soc_wh: float,
                              capacity_wh: float, desired_duration_s: float,
-                             preferred_map_id: int = None):
-        """Request charging"""
+                             preferred_map_id: int = None,
+                             override_policy: bool = False,
+                             target_soc_wh: float = None):
+        """Request charging.
+
+        Parameters
+        ----------
+        override_policy : bool
+            When True, skip the ``policy.wants_charge`` check.  Used by
+            the advanced heuristics scheduler which makes its own start/
+            stop decisions.
+        target_soc_wh : float, optional
+            When provided, the charging session targets this SOC instead
+            of the fixed policy target (e.g. 80%).  Used by the advanced
+            heuristics scheduler.
+        """
 
         if not self.charging_enabled:
             return (False, 0.0, 0.0)
@@ -830,7 +853,7 @@ class PreemptiveStopChargingManager:
         if not stop_id:
             return (False, 0.0, 0.0)
 
-        if not self.policy.wants_charge(soc_wh, capacity_wh):
+        if not override_policy and not self.policy.wants_charge(soc_wh, capacity_wh):
             return (False, 0.0, 0.0)
 
         req = {
@@ -839,7 +862,8 @@ class PreemptiveStopChargingManager:
             "capacity": capacity_wh,
             "desired": desired_duration_s,
             "requested_time": float(self.env.now),
-            "preferred_map_id": preferred_map_id
+            "preferred_map_id": preferred_map_id,
+            "target_soc_wh": target_soc_wh,
         }
 
         soc_ratio = soc_wh / capacity_wh if capacity_wh > 0 else 0
@@ -1197,7 +1221,8 @@ class Stage2DESTerminalChargingPreemptive:
                  optimize_threshold: bool = True,
                  preemption_threshold: Optional[float] = None,
                  line_battery_capacities_wh: Optional[Dict[str, float]] = None,
-                 map_battery_capacity_wh: Optional[float] = None):
+                 map_battery_capacity_wh: Optional[float] = None,
+                 use_advanced_heuristics: bool = False):
 
         self.sim = sim
         self.bus_trips_dict = bus_trips_dict
@@ -1205,6 +1230,7 @@ class Stage2DESTerminalChargingPreemptive:
         self.trip_change_stops = trip_change_stops
         self.battery_capacity_wh = initial_battery_capacity_wh
         self.num_maps = num_maps
+        self.use_advanced_heuristics = use_advanced_heuristics
         # Per-line battery capacities (Wh); falls back to initial_battery_capacity_wh
         self.line_battery_capacities_wh = line_battery_capacities_wh or {}
         # MAP battery capacity; falls back to module constant
@@ -1282,6 +1308,24 @@ class Stage2DESTerminalChargingPreemptive:
 
         self.bus_soc = defaultdict(float)
         self.bus_energy_charged = defaultdict(float)
+
+        # Initialize advanced heuristics scheduler if enabled
+        self.advanced_scheduler = None
+        if use_advanced_heuristics and num_maps > 0:
+            from advanced_heuristics import AdvancedMAPScheduler
+            self.advanced_scheduler = AdvancedMAPScheduler(
+                sim=sim,
+                bus_trips_dict=bus_trips_dict,
+                line_battery_capacities_wh=self.line_battery_capacities_wh,
+                default_battery_capacity_wh=initial_battery_capacity_wh,
+                num_maps=num_maps,
+                map_battery_capacity_wh=self.map_battery_capacity_wh,
+                map_movement_scheduler=self.map_movement_scheduler,
+                charging_rate_wh_s=MAP_CHARGING_RATE_WH_S,
+            )
+            print(f"\n[ADVANCED] Using rolling-horizon MAP scheduling heuristics")
+            print(f"  Dynamic start/stop thresholds enabled (no fixed 70%/80%)")
+            print(f"  Multi-criteria MAP selection with energy conservation")
 
     def _get_bus_capacity(self, line_id: str) -> float:
         """Return battery capacity (Wh) for a given line_id.
@@ -1378,6 +1422,7 @@ class Stage2DESTerminalChargingPreemptive:
         print(f"Trip-change stops: {len(self.trip_change_stops)}")
         print(f"Available MAPs: {self.num_maps}")
         print(f"MAP battery: {self.map_battery_capacity_wh/1000:.0f} kWh | Min SOC: {MAP_MIN_SOC*100:.0f}% | Self-charge: {MAP_SELF_CHARGE_RATE_WH_S} Wh/s")
+        print(f"Charging strategy: {'ADVANCED (rolling-horizon)' if self.use_advanced_heuristics else 'GREEDY (distance+energy+fairness+urgency)'}")
 
         if self.preemption_threshold is not None:
             print(f"Preemption threshold (OPTIMIZED): {self.preemption_threshold*100:.1f}% SOC")
@@ -1460,12 +1505,35 @@ class Stage2DESTerminalChargingPreemptive:
                             soc_at_departure_wh=soc_now
                         )
 
-                        # Greedy MAP assignment: charge any bus below BUS_CHARGE_CUTOFF_SOC
-                        if self.stop_charging_manager.charging_enabled and soc_now < BUS_CHARGE_CUTOFF_SOC * capacity:
-                            # Greedy heuristic selects best MAP (by distance, energy, line fairness, urgency)
-                            map_id = self._select_best_map(bus_id, line_id, start_stop_id, soc_now, capacity)
+                        # Charging decision — greedy or advanced heuristics
+                        if self.stop_charging_manager.charging_enabled:
+                            should_charge = False
+                            map_id = None
+                            adv_target_soc_wh = None
 
-                            if map_id is not None:
+                            if self.advanced_scheduler is not None:
+                                # --- Advanced heuristic ---
+                                decision = self.advanced_scheduler.decide_charging(
+                                    bus_id=bus_id,
+                                    line_id=line_id,
+                                    stop_id=start_stop_id,
+                                    soc_wh=soc_now,
+                                    capacity_wh=capacity,
+                                    current_time_s=float(self.env.now),
+                                    layover_duration_s=duration,
+                                    all_bus_soc=dict(self.bus_soc),
+                                    line_charge_counts=self.stop_charging_manager.get_line_charge_counts(),
+                                )
+                                should_charge = decision.should_charge
+                                map_id = decision.map_id
+                                adv_target_soc_wh = decision.target_soc_wh
+                            else:
+                                # --- Greedy heuristic (original) ---
+                                if soc_now < BUS_CHARGE_CUTOFF_SOC * capacity:
+                                    map_id = self._select_best_map(bus_id, line_id, start_stop_id, soc_now, capacity)
+                                    should_charge = (map_id is not None)
+
+                            if should_charge and map_id is not None:
                                 # Move MAP to this location
                                 travel_time_distance = self.map_movement_scheduler.assign_map_to_bus(
                                     map_id=map_id,
@@ -1490,7 +1558,9 @@ class Stage2DESTerminalChargingPreemptive:
                                         soc_wh=soc_now,
                                         capacity_wh=capacity,
                                         desired_duration_s=remaining_duration,
-                                        preferred_map_id=map_id
+                                        preferred_map_id=map_id,
+                                        override_policy=(adv_target_soc_wh is not None),
+                                        target_soc_wh=adv_target_soc_wh,
                                     )
 
                                     if started and actual_dur > 0:
@@ -1582,6 +1652,7 @@ class Stage2DESTerminalChargingPreemptive:
             'line_battery_capacities_wh': dict(self.line_battery_capacities_wh),
             'num_maps': self.num_maps,
             'charging_enabled': self.stop_charging_manager.charging_enabled,
+            'charging_strategy': 'advanced' if self.use_advanced_heuristics else 'greedy',
             'preemption_threshold': self.preemption_threshold,
             'trip_change_stops': len(self.trip_change_stops),
             'num_buses': len(self.buses),
@@ -2023,8 +2094,18 @@ def run_terminal_charging_simulation(sim, bus_trips_dict, bus_lines, trip_change
                                     preemption_threshold: Optional[float] = None,
                                     simulation_duration_s: float = 86400,
                                     line_battery_capacities_wh: Optional[Dict[str, float]] = None,
-                                    map_battery_capacity_wh: Optional[float] = None):
-    """Execute terminal charging simulation with MAP tracking"""
+                                    map_battery_capacity_wh: Optional[float] = None,
+                                    use_advanced_heuristics: bool = False):
+    """Execute terminal charging simulation with MAP tracking.
+
+    Parameters
+    ----------
+    use_advanced_heuristics : bool
+        When True, uses the rolling-horizon AdvancedMAPScheduler from
+        advanced_heuristics.py instead of the built-in greedy heuristic.
+        The advanced scheduler dynamically determines start/stop charging
+        thresholds instead of using fixed 70%/80%.
+    """
 
     stage2 = Stage2DESTerminalChargingPreemptive(
         sim=sim,
@@ -2036,7 +2117,8 @@ def run_terminal_charging_simulation(sim, bus_trips_dict, bus_lines, trip_change
         optimize_threshold=optimize_threshold,
         preemption_threshold=preemption_threshold,
         line_battery_capacities_wh=line_battery_capacities_wh,
-        map_battery_capacity_wh=map_battery_capacity_wh
+        map_battery_capacity_wh=map_battery_capacity_wh,
+        use_advanced_heuristics=use_advanced_heuristics,
     )
 
     results = stage2.run_simulation(simulation_duration_s)
@@ -2063,6 +2145,7 @@ def run_terminal_charging_simulation(sim, bus_trips_dict, bus_lines, trip_change
     print(f"Trip-change stops: {results['trip_change_stops']}")
     print(f"Available MAPs: {results['num_maps']}")
     print(f"Charging enabled: {'YES' if results['charging_enabled'] else 'NO'}")
+    print(f"Charging strategy: {results.get('charging_strategy', 'greedy').upper()}")
 
     if results['preemption_threshold'] is not None:
         print(f"Preemption threshold: {results['preemption_threshold']*100:.1f}% SOC")
