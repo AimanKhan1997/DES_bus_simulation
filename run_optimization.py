@@ -159,6 +159,10 @@ def run_milp_simulation_loop(sim, bus_trips, bus_lines, trip_change_stops,
        single pass, because further constraint changes may open new
        search directions.
 
+    The default of 50 iterations allows the MILP sufficient room to
+    explore the search space.  The loop also stops after 3 consecutive
+    MILP failures (no solution found) to avoid infinite spinning.
+
     Graphs are generated only for the best feasible (optimal) iteration,
     not for intermediate ones.
 
@@ -215,8 +219,7 @@ def run_milp_simulation_loop(sim, bus_trips, bus_lines, trip_change_stops,
         if milp_results is None or milp_results.get('objective_value') is None:
             consecutive_milp_failures += 1
             if consecutive_milp_failures >= MAX_CONSECUTIVE_MILP_FAILURES:
-                print(f"\n[!] MILP returned no solution {MAX_CONSECUTIVE_MILP_FAILURES} "
-                      f"times in a row - stopping loop.")
+                print(f"\n[!] MILP returned no solution {MAX_CONSECUTIVE_MILP_FAILURES} times in a row - stopping loop.")
                 break
             # Remove the cost_upper_bound so MILP can find any feasible
             # solution on the next pass.
