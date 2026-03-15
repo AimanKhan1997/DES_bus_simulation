@@ -154,14 +154,13 @@ def run_milp_simulation_loop(sim, bus_trips, bus_lines, trip_change_stops,
     4. If simulation is feasible -> record as best if lowest cost, then
        add a cost upper-bound constraint and continue searching.
     5. If infeasible -> diagnose, add constraints, re-run MILP, repeat.
-    6. Stop only when max iterations is reached.  The loop does NOT
-       stop early when the MILP cannot find a cheaper solution in a
-       single pass, because further constraint changes may open new
-       search directions.
+    6. Always runs all iterations up to max_iterations and then returns
+       the best feasible solution found across all iterations.
 
     The default of 50 iterations allows the MILP sufficient room to
-    explore the search space.  The loop also stops after 3 consecutive
-    MILP failures (no solution found) to avoid infinite spinning.
+    explore the search space.  The loop never stops early — it always
+    runs to max_iterations so the MILP has maximum opportunity to find
+    cheaper solutions.
 
     Graphs are generated only for the best feasible (optimal) iteration,
     not for intermediate ones.
@@ -219,8 +218,8 @@ def run_milp_simulation_loop(sim, bus_trips, bus_lines, trip_change_stops,
         if milp_results is None or milp_results.get('objective_value') is None:
             consecutive_milp_failures += 1
             if consecutive_milp_failures >= MAX_CONSECUTIVE_MILP_FAILURES:
-                print(f"\n[!] MILP returned no solution {MAX_CONSECUTIVE_MILP_FAILURES} times in a row - stopping loop.")
-                break
+                print(f"\n[!] MILP returned no solution {MAX_CONSECUTIVE_MILP_FAILURES} times in a row - resetting and continuing.")
+                consecutive_milp_failures = 0
             # Remove the cost_upper_bound so MILP can find any feasible
             # solution on the next pass.
             feedback_constraints = [
@@ -342,8 +341,8 @@ def run_milp_simulation_loop(sim, bus_trips, bus_lines, trip_change_stops,
         # --- Infeasible: diagnose and add constraints ---
         new_constraints = diagnose_infeasibility(results, results['bus_statistics'])
         if not new_constraints:
-            print("  Could not diagnose infeasibility - stopping loop.")
-            break
+            print("  Could not diagnose infeasibility - continuing to next iteration.")
+            continue
 
         for fc in new_constraints:
             print(f"  FEEDBACK: {fc['reason']}")
