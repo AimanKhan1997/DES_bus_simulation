@@ -2095,7 +2095,8 @@ def run_terminal_charging_simulation(sim, bus_trips_dict, bus_lines, trip_change
                                     simulation_duration_s: float = 86400,
                                     line_battery_capacities_wh: Optional[Dict[str, float]] = None,
                                     map_battery_capacity_wh: Optional[float] = None,
-                                    use_advanced_heuristics: bool = False):
+                                    use_advanced_heuristics: bool = False,
+                                    skip_plots: bool = False):
     """Execute terminal charging simulation with MAP tracking.
 
     Parameters
@@ -2105,6 +2106,10 @@ def run_terminal_charging_simulation(sim, bus_trips_dict, bus_lines, trip_change
         advanced_heuristics.py instead of the built-in greedy heuristic.
         The advanced scheduler dynamically determines start/stop charging
         thresholds instead of using fixed 70%/80%.
+    skip_plots : bool
+        When True, skip generating plots.  Useful during intermediate
+        iterations of the MILP feedback loop so that plots are only
+        generated for the final / optimal solution.
     """
 
     stage2 = Stage2DESTerminalChargingPreemptive(
@@ -2167,12 +2172,13 @@ def run_terminal_charging_simulation(sim, bus_trips_dict, bus_lines, trip_change
 
     print("\n" + "="*70)
 
-    # Plots
-    stage2.plot_soc(save_path="bus_soc_terminal_charging_optimized.png")
-    stage2.plot_map_energy_delivery(save_path="map_energy_delivery.png")
-    stage2.plot_cumulative_energy_delivery(save_path="cumulative_energy_delivery.png")
-    stage2.plot_map_movement(save_path="map_movement_distance.png")
-    stage2.plot_map_soc(save_path="map_soc_over_time.png")
-    stage2.plot_map_self_charge_heatmap(save_path="map_self_charge_heatmap.png")
+    # Plots (skip during intermediate MILP iterations)
+    if not skip_plots:
+        stage2.plot_soc(save_path="bus_soc_terminal_charging_optimized.png")
+        stage2.plot_map_energy_delivery(save_path="map_energy_delivery.png")
+        stage2.plot_cumulative_energy_delivery(save_path="cumulative_energy_delivery.png")
+        stage2.plot_map_movement(save_path="map_movement_distance.png")
+        stage2.plot_map_soc(save_path="map_soc_over_time.png")
+        stage2.plot_map_self_charge_heatmap(save_path="map_self_charge_heatmap.png")
 
     return results, stage2
