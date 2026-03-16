@@ -449,12 +449,18 @@ def run_milp_optimization(sim_data,
     charger_power_kw = energy_per_bus_kwh / OVERNIGHT_CHARGING_HOURS
     charger_cost_per_kw = get_overnight_charger_cost_per_kw(charger_power_kw)
 
+    per_bus_charger_cost = charger_cost_per_kw * charger_power_kw
+    total_overnight_cost = per_bus_charger_cost * num_buses
+
     print(f"\n  Overnight charging cost calculation:")
     print(f"    Sim overnight energy:  {sim_overnight_energy_kwh:.1f} kWh")
     print(f"    Number of buses:       {num_buses}")
     print(f"    Energy per bus:        {energy_per_bus_kwh:.1f} kWh")
     print(f"    Charger power level:   {charger_power_kw:.1f} kW")
     print(f"    Charger cost tier:     ${charger_cost_per_kw:.0f}/kW")
+    print(f"    Per-bus charger cost:  ${per_bus_charger_cost:,.2f}")
+    print(f"    Total overnight cost:  ${total_overnight_cost:,.2f}"
+          f"  ({num_buses} buses × ${per_bus_charger_cost:,.2f})")
 
     bus_battery_cost = gp.quicksum(
         BATTERY_COST_PER_KWH * B[l] * per_line[l]['num_buses']
@@ -462,13 +468,10 @@ def run_milp_optimization(sim_data,
     )
     map_battery_cost = BATTERY_COST_PER_KWH * W
     map_hardware_cost = MAP_HARDWARE_COST * N_map
-    # Each bus needs a charger of power = E_overnight_kwh / num_buses / 4h.
-    # Per-bus charger cost = cost_per_kw × power_per_bus.
-    # Total for all buses  = cost_per_kw × power_per_bus × num_buses
-    #                      = cost_per_kw × E_overnight_kwh / 4  (num_buses cancels)
-    overnight_cost = (charger_cost_per_kw
-                      * E_overnight / 1000.0
-                      / OVERNIGHT_CHARGING_HOURS)
+    # Per-bus charger cost = cost_per_kw × charger_power_kw
+    # Total overnight cost = per_bus_charger_cost × num_buses
+    # Each bus requires its own charger.
+    overnight_cost = total_overnight_cost
     bus_penalty = BUS_SOC_VIOLATION_PENALTY * gp.quicksum(
         v_bus[b] for b in bus_ids)
     map_penalty = MAP_SOC_VIOLATION_PENALTY * v_map
@@ -508,8 +511,7 @@ def run_milp_optimization(sim_data,
             for l in line_ids)
         cost_map_bat = BATTERY_COST_PER_KWH * W.X
         cost_map_hw = MAP_HARDWARE_COST * n_map_val
-        cost_overnight = (charger_cost_per_kw * e_overnight_val / 1000.0
-                         / OVERNIGHT_CHARGING_HOURS)
+        cost_overnight = total_overnight_cost
         n_bus_violations = sum(int(round(v_bus[b].X)) for b in bus_ids)
         n_map_violations = int(round(v_map.X))
         cost_penalty = (BUS_SOC_VIOLATION_PENALTY * n_bus_violations
@@ -525,6 +527,7 @@ def run_milp_optimization(sim_data,
             'overnight_energy_kwh': e_overnight_val / 1000.0,
             'charger_power_kw': charger_power_kw,
             'charger_cost_per_kw': charger_cost_per_kw,
+            'per_bus_charger_cost': per_bus_charger_cost,
             'total_cost_breakdown': {
                 'bus_battery_cost': cost_bus_bat,
                 'map_battery_cost': cost_map_bat,
@@ -660,13 +663,18 @@ def post_simulation_optimize(results, stage2_sim, bus_lines,
               f"{opt_results['charger_power_kw']:.1f} kW")
         print(f"Charger Cost Tier:           "
               f"${opt_results['charger_cost_per_kw']:.0f}/kW")
+        print(f"Per-Bus Charger Cost:        "
+              f"${opt_results['per_bus_charger_cost']:,.2f}")
 
         cb = opt_results['total_cost_breakdown']
+        num_b = sim_data['system']['num_buses']
         print("\nCost Breakdown:")
         print(f"  Bus battery cost:      ${cb['bus_battery_cost']:>14,.2f}")
         print(f"  MAP battery cost:      ${cb['map_battery_cost']:>14,.2f}")
         print(f"  MAP hardware cost:     ${cb['map_hardware_cost']:>14,.2f}")
-        print(f"  Overnight charge cost: ${cb['overnight_cost']:>14,.2f}")
+        print(f"  Overnight charge cost: ${cb['overnight_cost']:>14,.2f}"
+              f"  ({num_b} buses × "
+              f"${opt_results['per_bus_charger_cost']:,.2f})")
         print(f"  Penalty cost:          ${cb['penalty_cost']:>14,.2f}")
         print(f"  Bus SOC violations:    {cb['bus_soc_violations']}")
         print(f"  MAP SOC violations:    {cb['map_soc_violations']}")
