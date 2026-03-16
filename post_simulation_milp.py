@@ -13,8 +13,17 @@ Objective: Minimize total system cost
     = bus battery cost  (115 $/kWh × capacity × buses per line)
     + MAP battery cost  (115 $/kWh × capacity × number of MAPs)
     + MAP hardware cost (40,000 $ × number of MAPs)
-    + overnight charging cost (500 $/kWh × overnight energy)
+    + overnight charging infrastructure cost (tiered $/kW based on charger power level)
     + penalty for SOC violations
+
+Overnight Charging Cost Tiers (per kW of charger capacity):
+    Charger power 0–22 kW   → $250/kW
+    Charger power 22–50 kW  → $450/kW
+    Charger power 50–150 kW → $550/kW
+    Charger power 150–350 kW → $600/kW
+    Charger power ≥350 kW   → $600/kW
+
+    Charger power is determined by: (overnight energy kWh / num_buses) / 4 hours
 
 Constraints:
     - No bus may go below 20% SOC (with penalty slack)
@@ -28,12 +37,37 @@ from collections import defaultdict
 # COST PARAMETERS
 # ========================
 BATTERY_COST_PER_KWH = 115.0              # $/kWh for bus and MAP batteries
-OVERNIGHT_CHARGE_COST_PER_KWH = 500.0      # $/kWh for overnight depot charging
 MAP_HARDWARE_COST = 40000.0               # $ per MAP unit
 BUS_SOC_VIOLATION_PENALTY = 1_000_000.0   # penalty per bus that violates 20% SOC
 MAP_SOC_VIOLATION_PENALTY = 1_000_000.0   # penalty per MAP that violates 10% SOC
 BUS_MIN_SOC_FRACTION = 0.20               # 20% minimum bus SOC
 MAP_MIN_SOC_FRACTION = 0.10               # 10% minimum MAP SOC
+OVERNIGHT_CHARGING_HOURS = 4.0            # hours available for overnight charging
+
+
+def get_overnight_charger_cost_per_kw(charger_power_kw):
+    """
+    Return the overnight charger infrastructure cost ($/kW) based on
+    the required charger power level.
+
+    Tiers
+    -----
+        0 – 22 kW   → $250 / kW
+        22 – 50 kW  → $450 / kW
+        50 – 150 kW → $550 / kW
+        150 – 350 kW → $600 / kW
+        ≥ 350 kW    → $600 / kW
+    """
+    if charger_power_kw <= 22:
+        return 250.0
+    elif charger_power_kw <= 50:
+        return 450.0
+    elif charger_power_kw <= 150:
+        return 550.0
+    elif charger_power_kw <= 350:
+        return 600.0
+    else:
+        return 600.0
 
 
 # ========================
@@ -403,13 +437,38 @@ def run_milp_optimization(sim_data,
     # ---------------------------------------------------------------
     # Objective
     # ---------------------------------------------------------------
+    # Calculate overnight charger power tier from simulation data
+    # to determine the appropriate charging infrastructure cost.
+    num_buses = sys_data['num_buses']
+    sim_overnight_energy_kwh = max(0.0,
+        (total_energy_consumed - total_energy_charged) / 1000.0)
+    if num_buses > 0:
+        energy_per_bus_kwh = sim_overnight_energy_kwh / num_buses
+    else:
+        energy_per_bus_kwh = 0.0
+    charger_power_kw = energy_per_bus_kwh / OVERNIGHT_CHARGING_HOURS
+    charger_cost_per_kw = get_overnight_charger_cost_per_kw(charger_power_kw)
+
+    print(f"\n  Overnight charging cost calculation:")
+    print(f"    Sim overnight energy:  {sim_overnight_energy_kwh:.1f} kWh")
+    print(f"    Number of buses:       {num_buses}")
+    print(f"    Energy per bus:        {energy_per_bus_kwh:.1f} kWh")
+    print(f"    Charger power level:   {charger_power_kw:.1f} kW")
+    print(f"    Charger cost tier:     ${charger_cost_per_kw:.0f}/kW")
+
     bus_battery_cost = gp.quicksum(
         BATTERY_COST_PER_KWH * B[l] * per_line[l]['num_buses']
         for l in line_ids
     )
     map_battery_cost = BATTERY_COST_PER_KWH * W
     map_hardware_cost = MAP_HARDWARE_COST * N_map
-    overnight_cost = OVERNIGHT_CHARGE_COST_PER_KWH * E_overnight / 1000.0
+    # Each bus needs a charger of power = E_overnight_kwh / num_buses / 4h.
+    # Per-bus charger cost = cost_per_kw × power_per_bus.
+    # Total for all buses  = cost_per_kw × power_per_bus × num_buses
+    #                      = cost_per_kw × E_overnight_kwh / 4  (num_buses cancels)
+    overnight_cost = (charger_cost_per_kw
+                      * E_overnight / 1000.0
+                      / OVERNIGHT_CHARGING_HOURS)
     bus_penalty = BUS_SOC_VIOLATION_PENALTY * gp.quicksum(
         v_bus[b] for b in bus_ids)
     map_penalty = MAP_SOC_VIOLATION_PENALTY * v_map
@@ -449,7 +508,8 @@ def run_milp_optimization(sim_data,
             for l in line_ids)
         cost_map_bat = BATTERY_COST_PER_KWH * W.X
         cost_map_hw = MAP_HARDWARE_COST * n_map_val
-        cost_overnight = OVERNIGHT_CHARGE_COST_PER_KWH * e_overnight_val / 1000.0
+        cost_overnight = (charger_cost_per_kw * e_overnight_val / 1000.0
+                         / OVERNIGHT_CHARGING_HOURS)
         n_bus_violations = sum(int(round(v_bus[b].X)) for b in bus_ids)
         n_map_violations = int(round(v_map.X))
         cost_penalty = (BUS_SOC_VIOLATION_PENALTY * n_bus_violations
@@ -463,6 +523,8 @@ def run_milp_optimization(sim_data,
             'map_battery_kwh': b_map_val,
             'num_maps': n_map_val,
             'overnight_energy_kwh': e_overnight_val / 1000.0,
+            'charger_power_kw': charger_power_kw,
+            'charger_cost_per_kw': charger_cost_per_kw,
             'total_cost_breakdown': {
                 'bus_battery_cost': cost_bus_bat,
                 'map_battery_cost': cost_map_bat,
@@ -594,6 +656,10 @@ def post_simulation_optimize(results, stage2_sim, bus_lines,
         print(f"Optimal Number of MAPs:      {opt_results['num_maps']}")
         print(f"Overnight Energy:            "
               f"{opt_results['overnight_energy_kwh']:.1f} kWh")
+        print(f"Charger Power Level:         "
+              f"{opt_results['charger_power_kw']:.1f} kW")
+        print(f"Charger Cost Tier:           "
+              f"${opt_results['charger_cost_per_kw']:.0f}/kW")
 
         cb = opt_results['total_cost_breakdown']
         print("\nCost Breakdown:")
