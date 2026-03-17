@@ -13,7 +13,7 @@ Objective: Minimize total system cost
     = bus battery cost  (115 $/kWh × capacity × buses per line)
     + MAP battery cost  (115 $/kWh × capacity × number of MAPs)
     + MAP hardware cost (40,000 $ × number of MAPs)
-    + overnight charging infrastructure cost (tiered $/kW based on charger power level)
+    + overnight charging infrastructure cost (cost_per_kw × E_overnight_kwh / 4)
     + penalty for SOC violations
 
 Overnight Charging Cost Tiers (per kW of charger capacity):
@@ -23,7 +23,10 @@ Overnight Charging Cost Tiers (per kW of charger capacity):
     Charger power 150–350 kW → $600/kW
     Charger power ≥350 kW   → $600/kW
 
-    Charger power is determined by: (overnight energy kWh / num_buses) / 4 hours
+    The tier is determined from the simulation's charger power level.
+    Overnight cost = cost_per_kw × (E_overnight / 1000) / 4
+    where E_overnight (Wh) is a MILP decision variable, so the optimizer
+    can see the benefit of MAPs reducing overnight energy requirements.
 
 Constraints:
     - No bus may go below 20% SOC (with penalty slack)
@@ -468,10 +471,14 @@ def run_milp_optimization(sim_data,
     )
     map_battery_cost = BATTERY_COST_PER_KWH * W
     map_hardware_cost = MAP_HARDWARE_COST * N_map
-    # Per-bus charger cost = cost_per_kw × charger_power_kw
-    # Total overnight cost = per_bus_charger_cost × num_buses
-    # Each bus requires its own charger.
-    overnight_cost = total_overnight_cost
+    # Overnight cost is a linear function of E_overnight so that the MILP
+    # can see the benefit of adding MAPs (which increase E_charged_scaled
+    # and thus reduce E_overnight).
+    # Total overnight cost = cost_per_kw × E_overnight_kwh / 4
+    #   = charger_cost_per_kw × (E_overnight / 1000) / OVERNIGHT_CHARGING_HOURS
+    overnight_cost_expr = (charger_cost_per_kw
+                           * E_overnight / 1000.0
+                           / OVERNIGHT_CHARGING_HOURS)
     bus_penalty = BUS_SOC_VIOLATION_PENALTY * gp.quicksum(
         v_bus[b] for b in bus_ids)
     map_penalty = MAP_SOC_VIOLATION_PENALTY * v_map
@@ -479,7 +486,7 @@ def run_milp_optimization(sim_data,
     total_cost_expr = (bus_battery_cost
                        + map_battery_cost
                        + map_hardware_cost
-                       + overnight_cost
+                       + overnight_cost_expr
                        + bus_penalty
                        + map_penalty)
 
@@ -511,7 +518,9 @@ def run_milp_optimization(sim_data,
             for l in line_ids)
         cost_map_bat = BATTERY_COST_PER_KWH * W.X
         cost_map_hw = MAP_HARDWARE_COST * n_map_val
-        cost_overnight = total_overnight_cost
+        cost_overnight = (charger_cost_per_kw
+                         * (e_overnight_val / 1000.0)
+                         / OVERNIGHT_CHARGING_HOURS)
         n_bus_violations = sum(int(round(v_bus[b].X)) for b in bus_ids)
         n_map_violations = int(round(v_map.X))
         cost_penalty = (BUS_SOC_VIOLATION_PENALTY * n_bus_violations

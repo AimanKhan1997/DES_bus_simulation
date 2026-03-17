@@ -125,18 +125,26 @@ def diagnose_infeasibility(results, bus_stats):
             })
 
     # --- Check MAP SOC violations / insufficient MAPs ---
-    if results.get('charging_enabled') and results['num_maps'] > 0:
-        # If min overall bus SOC is still very low despite charging,
-        # the system may need more MAPs
-        if results['min_soc_overall_ratio'] < bus_min_soc:
-            num_maps_cur = results['num_maps']
-            constraints.append({
-                'type': 'min_maps',
-                'value': num_maps_cur + 1,
-                'reason': (f"Overall min SOC {results['min_soc_overall_ratio']*100:.1f}% "
-                           f"< 20% despite {num_maps_cur} MAPs.  "
-                           f"Requiring at least {num_maps_cur + 1} MAPs."),
-            })
+    num_maps_cur = results.get('num_maps', 0)
+    if num_maps_cur == 0 and results['min_soc_overall_ratio'] < bus_min_soc:
+        # No MAPs at all → charging disabled → buses can't recharge during
+        # the day.  Force the MILP to use at least 1 MAP.
+        constraints.append({
+            'type': 'min_maps',
+            'value': 1,
+            'reason': (f"Overall min SOC {results['min_soc_overall_ratio']*100:.1f}% "
+                       f"< {bus_min_soc*100:.0f}% with 0 MAPs (charging disabled).  "
+                       f"Requiring at least 1 MAP."),
+        })
+    elif num_maps_cur > 0 and results['min_soc_overall_ratio'] < bus_min_soc:
+        # MAPs are present but not enough → request one more
+        constraints.append({
+            'type': 'min_maps',
+            'value': num_maps_cur + 1,
+            'reason': (f"Overall min SOC {results['min_soc_overall_ratio']*100:.1f}% "
+                       f"< {bus_min_soc*100:.0f}% despite {num_maps_cur} MAPs.  "
+                       f"Requiring at least {num_maps_cur + 1} MAPs."),
+        })
 
     return constraints
 
