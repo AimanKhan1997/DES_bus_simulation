@@ -171,10 +171,19 @@ def run_milp_simulation_loop(sim, bus_trips, bus_lines, trip_change_stops,
     iteration_log = []
     best_feasible = None
 
-    # --- Initial simulation (iteration 0) ---
+    # --- Iteration 0: simulate with user-provided start values ---
     print("\n" + "=" * 70)
-    print("FEEDBACK LOOP: INITIAL SIMULATION (Iteration 0)")
+    print("FEEDBACK LOOP: ITERATION 0 (User-Provided Start Values)")
     print("=" * 70)
+
+    # Show the user-provided start values used for this iteration
+    user_line_caps_kwh = {lid: wh / 1000.0
+                          for lid, wh in line_battery_capacities_wh.items()}
+    print(f"  User-provided start values:")
+    for lid, cap in sorted(user_line_caps_kwh.items()):
+        print(f"    Line {lid} bus battery: {cap:.0f} kWh")
+    print(f"    Default bus battery: {initial_capacity_wh / 1000.0:.0f} kWh")
+    print(f"    Number of MAPs: {initial_num_maps}")
 
     results, stage2_sim = run_terminal_charging_simulation(
         sim=sim,
@@ -199,14 +208,15 @@ def run_milp_simulation_loop(sim, bus_trips, bus_lines, trip_change_stops,
         print("MILP solver not available - cannot run feedback loop.")
         return None, results, stage2_sim, []
 
+    # Log iteration 0 with user-provided values (not MILP outputs)
     iteration_log.append({
         'iteration': 0,
-        'milp_status': milp_results.get('status'),
+        'milp_status': 'user_initial',
         'sim_feasible': results['feasible'],
-        'bus_battery_kwh': milp_results.get('bus_battery_kwh'),
-        'map_battery_kwh': milp_results.get('map_battery_kwh'),
-        'num_maps': milp_results.get('num_maps'),
-        'objective': milp_results.get('objective_value'),
+        'bus_battery_kwh': user_line_caps_kwh,
+        'map_battery_kwh': None,
+        'num_maps': initial_num_maps,
+        'objective': None,
     })
 
     # Track consecutive MILP failures to avoid infinite spinning
