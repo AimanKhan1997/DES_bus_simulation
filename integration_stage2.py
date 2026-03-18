@@ -12,6 +12,7 @@ from collections import defaultdict
 import heapq
 from dataclasses import dataclass
 from pyproj import Geod
+from DES_model import energy_per_meter_for_capacity
 
 # ========================
 # PARAMETERS & CONSTANTS
@@ -27,20 +28,6 @@ BUS_MIN_SOC = 0.20
 MAX_CONCURRENT_CHARGERS = 2
 CHARGER_SPEED_MS = 37.78
 ENERGY_PER_METER_WH = 2.7  # default (for 470 kWh battery)
-
-
-def energy_per_meter_for_capacity(capacity_kwh: float) -> float:
-    """Return energy consumption rate (Wh/m) adjusted for battery capacity.
-
-    Lighter batteries (smaller capacity) reduce bus weight and thus energy
-    consumption.  The formula linearly reduces consumption from the baseline
-    2.7 Wh/m at 470 kWh:
-
-        rate = 2.7 - (470 - capacity_kwh) * 0.0005
-
-    For example a 270 kWh battery gives 2.7 - 200*0.0005 = 2.6 Wh/m.
-    """
-    return 2.7 - (470.0 - capacity_kwh) * 0.0005
 
 MAP_BATTERY_CAPACITY_WH = 150000   # 150 kWh per MAP
 MAP_MIN_SOC = 0.10                 # MAP cannot go below 10% SOC

@@ -24,7 +24,7 @@ from dataclasses import dataclass
 # Constraints (same as integration_stage2.py)
 BUS_MIN_SOC = 0.20
 MAP_MIN_SOC = 0.10
-from integration_stage2 import energy_per_meter_for_capacity
+from DES_model import energy_per_meter_for_capacity
 
 # Default fallback thresholds (used only when capacity data is unavailable)
 DEFAULT_CHARGE_START_PCT = 0.70
