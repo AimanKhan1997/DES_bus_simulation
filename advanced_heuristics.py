@@ -24,7 +24,7 @@ from dataclasses import dataclass
 # Constraints (same as integration_stage2.py)
 BUS_MIN_SOC = 0.20
 MAP_MIN_SOC = 0.10
-ENERGY_PER_METER_WH = 2.7
+from integration_stage2 import energy_per_meter_for_capacity
 
 # Default fallback thresholds (used only when capacity data is unavailable)
 DEFAULT_CHARGE_START_PCT = 0.70
@@ -106,6 +106,15 @@ class AdvancedMAPScheduler:
         for bus_id, trip_ids in self.bus_trips_dict.items():
             trip_profiles: List[Tuple[float, float, str]] = []
 
+            # Determine per-line capacity and energy rate for this bus
+            try:
+                line_id = bus_id.split('_')[0].replace('line', '')
+            except Exception:
+                line_id = "unknown"
+            bus_cap = self.line_battery_capacities_wh.get(
+                line_id, self.default_battery_capacity_wh)
+            bus_epm = energy_per_meter_for_capacity(bus_cap / 1000.0)
+
             sorted_trips = sorted(
                 trip_ids,
                 key=lambda t: (
@@ -133,7 +142,7 @@ class AdvancedMAPScheduler:
                             dist = abs(dist)
                         except Exception:
                             dist = 0.0
-                        trip_energy += dist * ENERGY_PER_METER_WH
+                        trip_energy += dist * bus_epm
 
                     start_time = seq[0]["arrival"]
                     first_stop = seq[0].get("stop_id", "unknown")

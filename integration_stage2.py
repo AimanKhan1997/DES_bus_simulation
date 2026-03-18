@@ -26,7 +26,21 @@ BUS_MIN_SOC = 0.20
 
 MAX_CONCURRENT_CHARGERS = 2
 CHARGER_SPEED_MS = 37.78
-ENERGY_PER_METER_WH = 2.7
+ENERGY_PER_METER_WH = 2.7  # default (for 470 kWh battery)
+
+
+def energy_per_meter_for_capacity(capacity_kwh: float) -> float:
+    """Return energy consumption rate (Wh/m) adjusted for battery capacity.
+
+    Lighter batteries (smaller capacity) reduce bus weight and thus energy
+    consumption.  The formula linearly reduces consumption from the baseline
+    2.7 Wh/m at 470 kWh:
+
+        rate = 2.7 - (470 - capacity_kwh) * 0.0005
+
+    For example a 270 kWh battery gives 2.7 - 200*0.0005 = 2.6 Wh/m.
+    """
+    return 2.7 - (470.0 - capacity_kwh) * 0.0005
 
 MAP_BATTERY_CAPACITY_WH = 150000   # 150 kWh per MAP
 MAP_MIN_SOC = 0.10                 # MAP cannot go below 10% SOC
@@ -299,11 +313,13 @@ class MAPUsageTracker:
 class PreemptionStrategyAnalyzer:
     """Analyzes bus energy consumption patterns and recommends optimal preemption strategy"""
 
-    def __init__(self, sim, bus_trips_dict: Dict[str, List[str]], battery_capacity_wh: float, num_maps: int = 1):
+    def __init__(self, sim, bus_trips_dict: Dict[str, List[str]], battery_capacity_wh: float, num_maps: int = 1,
+                 line_battery_capacities_wh: Optional[Dict[str, float]] = None):
         self.sim = sim
         self.bus_trips_dict = bus_trips_dict
         self.battery_capacity_wh = battery_capacity_wh
         self.num_maps = num_maps
+        self.line_battery_capacities_wh = line_battery_capacities_wh or {}
         self.bus_metrics = {}
         self._analyze_bus_patterns()
 
@@ -315,6 +331,14 @@ class PreemptionStrategyAnalyzer:
             soc_drops = []
             max_soc_drop = 0.0
             total_energy = 0.0
+
+            # Determine per-line capacity and energy rate for this bus
+            try:
+                line_id = bus_id.split('_')[0].replace('line', '')
+            except Exception:
+                line_id = "unknown"
+            bus_cap = self.line_battery_capacities_wh.get(line_id, self.battery_capacity_wh)
+            bus_epm = energy_per_meter_for_capacity(bus_cap / 1000.0)
 
             sorted_trips = sorted(
                 trip_ids,
@@ -346,12 +370,12 @@ class PreemptionStrategyAnalyzer:
                         except Exception:
                             dist = 0.0
 
-                        energy = dist * ENERGY_PER_METER_WH
+                        energy = dist * bus_epm
                         trip_energy += energy
                         total_energy += energy
                         energy_consumptions.append(energy)
 
-                    trip_soc_drop = trip_energy / self.battery_capacity_wh
+                    trip_soc_drop = trip_energy / bus_cap
                     soc_drops.append(trip_soc_drop)
                     max_soc_drop = max(max_soc_drop, trip_soc_drop)
 
@@ -1250,7 +1274,8 @@ class Stage2DESTerminalChargingPreemptive:
             print(f"\nUsing provided preemption threshold: {self.preemption_threshold*100:.1f}%")
         elif optimize_threshold:
             print(f"\nAnalyzing system to determine optimal preemption threshold...")
-            analyzer = PreemptionStrategyAnalyzer(sim, bus_trips_dict, initial_battery_capacity_wh, num_maps)
+            analyzer = PreemptionStrategyAnalyzer(sim, bus_trips_dict, initial_battery_capacity_wh, num_maps,
+                                                   line_battery_capacities_wh=line_battery_capacities_wh)
             self.preemption_threshold = analyzer.recommend_preemption_threshold()
             self.threshold_analysis = analyzer.get_analysis_report()
 
@@ -1416,9 +1441,10 @@ class Stage2DESTerminalChargingPreemptive:
         print("="*70)
         print(f"Battery capacity (default): {self.battery_capacity_wh/1000:,.1f} kWh")
         if self.line_battery_capacities_wh:
-            print(f"Per-line battery capacities:")
+            print(f"Per-line battery capacities (energy rate):")
             for lid, cap in sorted(self.line_battery_capacities_wh.items()):
-                print(f"  Line {lid}: {cap/1000:,.1f} kWh")
+                epm = energy_per_meter_for_capacity(cap / 1000.0)
+                print(f"  Line {lid}: {cap/1000:,.1f} kWh ({epm:.4f} Wh/m)")
         print(f"Trip-change stops: {len(self.trip_change_stops)}")
         print(f"Available MAPs: {self.num_maps}")
         print(f"MAP battery: {self.map_battery_capacity_wh/1000:.0f} kWh | Min SOC: {MAP_MIN_SOC*100:.0f}% | Self-charge: {MAP_SELF_CHARGE_RATE_WH_S} Wh/s")
@@ -1451,6 +1477,8 @@ class Stage2DESTerminalChargingPreemptive:
             line_id = "unknown"
 
         capacity = self._get_bus_capacity(line_id)
+        # Per-line energy consumption rate (Wh/m) based on battery capacity
+        bus_energy_per_meter = energy_per_meter_for_capacity(capacity / 1000.0)
         self.bus_soc[bus_id] = capacity
 
         current_time = 0.0
@@ -1606,7 +1634,7 @@ class Stage2DESTerminalChargingPreemptive:
                 yield self.env.timeout(max(0.0, dt))
                 current_time = curr_stop["arrival"]
 
-                energy = dist * ENERGY_PER_METER_WH
+                energy = dist * bus_energy_per_meter
                 prev_soc = self.bus_soc.get(bus_id, capacity)
                 new_soc = max(0.0, prev_soc - energy)
                 self.bus_soc[bus_id] = new_soc
@@ -1991,12 +2019,14 @@ class Stage2DESTerminalChargingPreemptive:
         plt.show()
 
     def plot_map_self_charge_heatmap(self, save_path: str = "map_self_charge_heatmap.png"):
-        """Plot a heatmap of stops where MAPs self-charge.
+        """Plot a heatmap of stops where MAPs self-charge on the OSM network.
 
         Uses the stop coordinates from the MAP movement scheduler and
-        counts the number of self-charge events at each stop to produce
-        a scatter-based heatmap.
+        counts the number of self-charge events at each stop.  The OSM
+        road network is rendered as a background layer using osmnx so that
+        the spatial context of the transit system is visible.
         """
+        import osmnx as ox
 
         records = self.map_tracker.self_charge_records
 
@@ -2030,7 +2060,13 @@ class Stage2DESTerminalChargingPreemptive:
             print("No self-charge locations with coordinates found")
             return
 
-        fig, ax = plt.subplots(figsize=(12, 10))
+        # --- Plot the OSM network as background ---
+        G = self.sim.osm.G
+        fig, ax = ox.plot_graph(
+            G, figsize=(14, 12), show=False, close=False,
+            node_size=0, edge_color='#999999', edge_linewidth=0.5,
+            bgcolor='white',
+        )
 
         sc = ax.scatter(
             lons, lats,
@@ -2063,8 +2099,8 @@ class Stage2DESTerminalChargingPreemptive:
 
         ax.set_xlabel('Longitude', fontweight='bold', fontsize=12)
         ax.set_ylabel('Latitude', fontweight='bold', fontsize=12)
-        ax.set_title('MAP Self-Charge Location Heatmap', fontweight='bold', fontsize=14)
-        ax.grid(True, alpha=0.3)
+        ax.set_title('MAP Self-Charge Location Heatmap (OSM Network)',
+                      fontweight='bold', fontsize=14)
 
         total_events = sum(counts)
         num_locations = len(counts)

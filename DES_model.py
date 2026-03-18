@@ -12,10 +12,29 @@ from osm_graph import OSMGraph
 # ---------------------------
 # Configuration
 # ---------------------------
-ENERGY_PER_METER_WH = 2.7  # Wh per meter
+ENERGY_PER_METER_WH = 2.7  # Wh per meter (default for 470 kWh battery)
 BATTERY_CAPACITY_WH = 470000
-def energy_consumption_wh(distance_m: float) -> float:
-    return ENERGY_PER_METER_WH * distance_m
+
+
+def energy_per_meter_for_capacity(capacity_kwh: float) -> float:
+    """Return energy consumption rate (Wh/m) adjusted for battery capacity.
+
+    Lighter batteries (smaller capacity) reduce bus weight and thus energy
+    consumption.  The formula linearly reduces consumption from the baseline
+    2.7 Wh/m at 470 kWh:
+
+        rate = 2.7 - (470 - capacity_kwh) * 0.0005
+    """
+    return 2.7 - (470.0 - capacity_kwh) * 0.0005
+
+
+def energy_consumption_wh(distance_m: float, capacity_kwh: float = 470.0) -> float:
+    """Energy consumed (Wh) over *distance_m* metres.
+
+    When *capacity_kwh* is supplied the per-line rate is used; otherwise the
+    default 470 kWh rate (2.7 Wh/m) is applied for backward compatibility.
+    """
+    return energy_per_meter_for_capacity(capacity_kwh) * distance_m
 
 @dataclass
 class BusState:
@@ -328,6 +347,8 @@ class GTFSBusSim:
 
     def bus_process(self, bus_id, trips):
         capacity = self.get_bus_capacity(bus_id)
+        # Per-line energy consumption rate (Wh/m) based on battery capacity
+        bus_energy_per_meter = energy_per_meter_for_capacity(capacity / 1000.0)
         # initialize central SOC for this bus to full capacity at start
         self.bus_soc[bus_id] = capacity
         # local reference will be read from central store as needed
@@ -433,7 +454,7 @@ class GTFSBusSim:
                 yield self.env.timeout(max(0.0, dt))
                 current_time = curr["arrival"]
 
-                energy = energy_consumption_wh(dist)
+                energy = dist * bus_energy_per_meter
                 # subtract consumption from central SOC store
                 prev_soc = self.bus_soc.get(bus_id, capacity)
                 new_soc = max(0.0, prev_soc - energy)
