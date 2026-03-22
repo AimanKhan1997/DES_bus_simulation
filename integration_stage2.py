@@ -34,6 +34,24 @@ MAP_MIN_SOC = 0.10                 # MAP cannot go below 10% SOC
 MAP_SELF_CHARGE_RATE_WH_S = 233.0  # MAP self-charges at 233 Wh/s
 
 # ========================
+# EN-ROUTE CHARGING STATE
+# ========================
+
+@dataclass
+class EnRouteChargingState:
+    """Tracks the state of a MAP that is attached to a bus for dynamic charging.
+
+    When a bus requests a charge, a MAP travels to it and stays attached,
+    charging the bus continuously across segments, stops, and layovers
+    until the target SOC is reached or the MAP runs out of energy.
+    """
+    map_id: int
+    target_soc_wh: float
+    start_time_s: float
+    total_energy_charged_wh: float = 0.0
+    location_type: str = "unknown"  # "segment", "stop", or "layover"
+
+# ========================
 # MAP USAGE TRACKER (NEW)
 # ========================
 
@@ -1321,6 +1339,10 @@ class Stage2DESTerminalChargingPreemptive:
         self.bus_soc = defaultdict(float)
         self.bus_energy_charged = defaultdict(float)
 
+        # Dynamic en-route charging: tracks which MAP is attached to each bus
+        # {bus_id: EnRouteChargingState}
+        self._bus_attached_map: Dict[str, EnRouteChargingState] = {}
+
         # Initialize advanced heuristics scheduler if enabled
         self.advanced_scheduler = None
         if use_advanced_heuristics and num_maps > 0:
@@ -1419,6 +1441,198 @@ class Stage2DESTerminalChargingPreemptive:
                 best_map = map_id
 
         return best_map
+
+    # ------------------------------------------------------------------
+    # Dynamic en-route charging methods
+    # ------------------------------------------------------------------
+
+    def _check_and_request_dynamic_charging(
+        self, bus_id: str, line_id: str, stop_id: str,
+        soc_wh: float, capacity_wh: float, location_type: str = "segment"
+    ) -> Optional[int]:
+        """Check if a bus needs charging and request a MAP dynamically.
+
+        This is called during segments, stops, and layovers to determine
+        if a MAP should be dispatched to the bus.  If a MAP is already
+        attached, this returns the existing MAP id.
+
+        Returns the map_id of the assigned/attached MAP, or None.
+        """
+        if self.num_maps <= 0 or not self.stop_charging_manager.charging_enabled:
+            return None
+
+        # Already has a MAP attached
+        if bus_id in self._bus_attached_map:
+            return self._bus_attached_map[bus_id].map_id
+
+        # Determine if charging is needed
+        should_charge = False
+        map_id = None
+        target_soc_wh = None
+
+        if self.advanced_scheduler is not None:
+            decision = self.advanced_scheduler.decide_charging(
+                bus_id=bus_id,
+                line_id=line_id,
+                stop_id=stop_id or "unknown",
+                soc_wh=soc_wh,
+                capacity_wh=capacity_wh,
+                current_time_s=float(self.env.now),
+                layover_duration_s=0.0,  # no fixed window for dynamic charging
+                all_bus_soc=dict(self.bus_soc),
+                line_charge_counts=self.stop_charging_manager.get_line_charge_counts(),
+            )
+            should_charge = decision.should_charge
+            map_id = decision.map_id
+            target_soc_wh = decision.target_soc_wh
+        else:
+            # Greedy heuristic
+            if soc_wh < BUS_CHARGE_CUTOFF_SOC * capacity_wh:
+                map_id = self._select_best_map(bus_id, line_id, stop_id or "depot",
+                                               soc_wh, capacity_wh)
+                should_charge = (map_id is not None)
+                if should_charge:
+                    target_soc_wh = BUS_CHARGE_CUTOFF_SOC * capacity_wh
+
+        if should_charge and map_id is not None:
+            # Calculate MAP travel to bus location
+            travel_result = self.map_movement_scheduler.assign_map_to_bus(
+                map_id=map_id,
+                bus_id=bus_id,
+                current_location=self.map_movement_scheduler.get_map_location(map_id),
+                target_location=stop_id or "depot"
+            )
+
+            # Attach MAP to bus for continuous charging
+            self._bus_attached_map[bus_id] = EnRouteChargingState(
+                map_id=map_id,
+                target_soc_wh=target_soc_wh if target_soc_wh else BUS_CHARGE_CUTOFF_SOC * capacity_wh,
+                start_time_s=float(self.env.now),
+                location_type=location_type,
+            )
+            return map_id
+
+        return None
+
+    def _apply_enroute_charging(
+        self, bus_id: str, duration_s: float, capacity_wh: float,
+        location_type: str = "segment", stop_id: str = None,
+    ) -> float:
+        """Apply charging from an attached MAP during a time period.
+
+        Called during segments (while bus is moving), at stops (during dwell),
+        and during layovers.  The MAP charges the bus at the standard charging
+        rate for the given duration or until the target SOC is reached.
+
+        Returns the energy charged (Wh).
+        """
+        if bus_id not in self._bus_attached_map:
+            return 0.0
+
+        state = self._bus_attached_map[bus_id]
+        map_id = state.map_id
+
+        # Check MAP is still available
+        if not self.map_movement_scheduler.is_map_available(map_id):
+            self._detach_map_from_bus(bus_id)
+            return 0.0
+
+        soc_now = self.bus_soc.get(bus_id, capacity_wh)
+
+        # Already at or above target
+        if soc_now >= state.target_soc_wh:
+            self._detach_map_from_bus(bus_id)
+            return 0.0
+
+        # Calculate chargeable amount
+        remaining_to_target = state.target_soc_wh - soc_now
+        max_from_rate = MAP_CHARGING_RATE_WH_S * duration_s
+        avail_from_map = self.map_movement_scheduler.available_energy_wh(map_id)
+
+        amount = min(remaining_to_target, max_from_rate, avail_from_map)
+
+        if amount <= 0:
+            if avail_from_map <= 0:
+                # MAP depleted — detach and trigger self-charge
+                self._detach_map_from_bus(bus_id)
+                if self.map_movement_scheduler.map_needs_self_charge(map_id):
+                    self.env.process(
+                        self.map_movement_scheduler.self_charge_process(map_id))
+            return 0.0
+
+        # Apply charge to bus
+        new_soc = min(capacity_wh, soc_now + amount)
+        actual_amount = new_soc - soc_now
+        self.bus_soc[bus_id] = new_soc
+        self.bus_energy_charged[bus_id] += actual_amount
+
+        # Deduct from MAP
+        self.map_movement_scheduler.update_map_soc(map_id, actual_amount)
+
+        # Update state
+        state.total_energy_charged_wh += actual_amount
+        state.location_type = location_type
+
+        # Record charging event
+        actual_duration = actual_amount / MAP_CHARGING_RATE_WH_S if MAP_CHARGING_RATE_WH_S > 0 else 0
+        charging_event = {
+            "bus_id": bus_id,
+            "stop_id": stop_id or f"enroute_{location_type}",
+            "start_time_s": float(self.env.now),
+            "duration_s": actual_duration,
+            "energy_wh": actual_amount,
+            "preempted": False,
+            "map_id": map_id,
+            "dynamic_charging": True,
+            "location_type": location_type,
+        }
+        self.stop_charging_manager._charging_events.append(charging_event)
+
+        # Record in MAP tracker
+        if self.map_tracker:
+            self.map_tracker.record_charge(
+                map_id=map_id,
+                bus_id=bus_id,
+                start_time=float(self.env.now),
+                end_time=float(self.env.now) + actual_duration,
+                energy_wh=actual_amount,
+                location=f"{location_type}_{stop_id}" if stop_id else f"enroute_{location_type}",
+                soc_before=soc_now,
+                soc_after=new_soc,
+            )
+
+        # Update SOC history
+        self.bus_soc_history[bus_id].append((float(self.env.now), new_soc))
+
+        # Track per-line counts for fairness
+        try:
+            _line_id = bus_id.split('_')[0].replace('line', '')
+        except Exception:
+            _line_id = "unknown"
+        self.stop_charging_manager._line_charge_counts[_line_id] += 1
+
+        # Check if target reached → detach
+        if new_soc >= state.target_soc_wh:
+            self._detach_map_from_bus(bus_id)
+        elif avail_from_map - actual_amount <= 0:
+            # MAP depleted after this charge
+            self._detach_map_from_bus(bus_id)
+            if self.map_movement_scheduler.map_needs_self_charge(map_id):
+                self.env.process(
+                    self.map_movement_scheduler.self_charge_process(map_id))
+
+        return actual_amount
+
+    def _detach_map_from_bus(self, bus_id: str):
+        """Detach a MAP from a bus, releasing it for other assignments."""
+        if bus_id not in self._bus_attached_map:
+            return
+
+        state = self._bus_attached_map.pop(bus_id)
+        # Clear the MAP's bus assignment so it's available for others
+        map_state = self.map_movement_scheduler.map_states.get(state.map_id)
+        if map_state:
+            map_state.assigned_bus_id = None
 
     def run_simulation(self, duration_s: float = 86400) -> Dict:
         """Run DES simulation"""
@@ -1520,33 +1734,48 @@ class Stage2DESTerminalChargingPreemptive:
                             soc_at_departure_wh=soc_now
                         )
 
+                        # If a MAP is already attached (from a previous phase),
+                        # continue charging during the layover.
+                        if bus_id in self._bus_attached_map:
+                            soc_now = self.bus_soc.get(bus_id, capacity)
+                            charged = self._apply_enroute_charging(
+                                bus_id, duration, capacity,
+                                location_type="layover", stop_id=start_stop_id,
+                            )
+                            if charged > 0:
+                                layover.was_charged = True
+                                layover.energy_charged_wh += charged
+
                         # Charging decision — greedy or advanced heuristics
                         if self.stop_charging_manager.charging_enabled:
                             should_charge = False
                             map_id = None
                             adv_target_soc_wh = None
 
-                            if self.advanced_scheduler is not None:
-                                # --- Advanced heuristic ---
-                                decision = self.advanced_scheduler.decide_charging(
-                                    bus_id=bus_id,
-                                    line_id=line_id,
-                                    stop_id=start_stop_id,
-                                    soc_wh=soc_now,
-                                    capacity_wh=capacity,
-                                    current_time_s=float(self.env.now),
-                                    layover_duration_s=duration,
-                                    all_bus_soc=dict(self.bus_soc),
-                                    line_charge_counts=self.stop_charging_manager.get_line_charge_counts(),
-                                )
-                                should_charge = decision.should_charge
-                                map_id = decision.map_id
-                                adv_target_soc_wh = decision.target_soc_wh
-                            else:
-                                # --- Greedy heuristic (original) ---
-                                if soc_now < BUS_CHARGE_CUTOFF_SOC * capacity:
-                                    map_id = self._select_best_map(bus_id, line_id, start_stop_id, soc_now, capacity)
-                                    should_charge = (map_id is not None)
+                            # Skip if already has a MAP attached and charging
+                            if bus_id not in self._bus_attached_map:
+                                if self.advanced_scheduler is not None:
+                                    # --- Advanced heuristic ---
+                                    decision = self.advanced_scheduler.decide_charging(
+                                        bus_id=bus_id,
+                                        line_id=line_id,
+                                        stop_id=start_stop_id,
+                                        soc_wh=self.bus_soc.get(bus_id, capacity),
+                                        capacity_wh=capacity,
+                                        current_time_s=float(self.env.now),
+                                        layover_duration_s=duration,
+                                        all_bus_soc=dict(self.bus_soc),
+                                        line_charge_counts=self.stop_charging_manager.get_line_charge_counts(),
+                                    )
+                                    should_charge = decision.should_charge
+                                    map_id = decision.map_id
+                                    adv_target_soc_wh = decision.target_soc_wh
+                                else:
+                                    # --- Greedy heuristic (original) ---
+                                    soc_now = self.bus_soc.get(bus_id, capacity)
+                                    if soc_now < BUS_CHARGE_CUTOFF_SOC * capacity:
+                                        map_id = self._select_best_map(bus_id, line_id, start_stop_id, soc_now, capacity)
+                                        should_charge = (map_id is not None)
 
                             if should_charge and map_id is not None:
                                 # Move MAP to this location
@@ -1570,7 +1799,7 @@ class Stage2DESTerminalChargingPreemptive:
                                     started, actual_dur, amount = self.stop_charging_manager.request_stop_charging(
                                         stop_id=start_stop_id,
                                         bus_id=bus_id,
-                                        soc_wh=soc_now,
+                                        soc_wh=self.bus_soc.get(bus_id, capacity),
                                         capacity_wh=capacity,
                                         desired_duration_s=remaining_duration,
                                         preferred_map_id=map_id,
@@ -1580,6 +1809,18 @@ class Stage2DESTerminalChargingPreemptive:
 
                                     if started and actual_dur > 0:
                                         yield self.env.timeout(actual_dur)
+
+                                    # If target SOC not reached, attach MAP for
+                                    # continuous charging across upcoming segments
+                                    soc_after = self.bus_soc.get(bus_id, capacity)
+                                    target = adv_target_soc_wh if adv_target_soc_wh else BUS_CHARGE_CUTOFF_SOC * capacity
+                                    if soc_after < target and self.map_movement_scheduler.available_energy_wh(map_id) > 0:
+                                        self._bus_attached_map[bus_id] = EnRouteChargingState(
+                                            map_id=map_id,
+                                            target_soc_wh=target,
+                                            start_time_s=float(self.env.now),
+                                            location_type="layover",
+                                        )
 
                         # Wait for the full layover duration
                         yield self.env.timeout(duration)
@@ -1628,6 +1869,25 @@ class Stage2DESTerminalChargingPreemptive:
 
                 self.buses[bus_id]['total_energy_consumed_wh'] += energy
 
+                # --- Dynamic en-route charging during segment ---
+                # If a MAP is attached, charge the bus during this segment
+                curr_stop_id = curr_stop.get("stop_id")
+                if bus_id in self._bus_attached_map and dt > 0:
+                    self._apply_enroute_charging(
+                        bus_id, dt, capacity,
+                        location_type="segment", stop_id=curr_stop_id,
+                    )
+                    new_soc = self.bus_soc.get(bus_id, capacity)
+
+                # If SOC is low and no MAP attached, request one dynamically
+                if (bus_id not in self._bus_attached_map
+                        and new_soc < BUS_CHARGE_THRESHOLD_SOC * capacity
+                        and self.stop_charging_manager.charging_enabled):
+                    self._check_and_request_dynamic_charging(
+                        bus_id, line_id, curr_stop_id,
+                        new_soc, capacity, location_type="segment",
+                    )
+
                 if new_soc < self.buses[bus_id]['min_soc_wh']:
                     self.buses[bus_id]['min_soc_wh'] = new_soc
 
@@ -1662,6 +1922,13 @@ class Stage2DESTerminalChargingPreemptive:
         total_energy_charged = sum(self.bus_energy_charged.values())
         num_preemptions = len(self.stop_charging_manager.get_preemption_events())
 
+        # Count dynamic (en-route) charging events
+        all_events = self.stop_charging_manager.get_charging_events()
+        dynamic_events = [e for e in all_events if e.get("dynamic_charging", False)]
+        segment_events = [e for e in dynamic_events if e.get("location_type") == "segment"]
+        stop_events = [e for e in dynamic_events if e.get("location_type") == "stop"]
+        layover_dynamic_events = [e for e in dynamic_events if e.get("location_type") == "layover"]
+
         return {
             'battery_capacity_wh': self.battery_capacity_wh,
             'line_battery_capacities_wh': dict(self.line_battery_capacities_wh),
@@ -1678,7 +1945,16 @@ class Stage2DESTerminalChargingPreemptive:
             'min_soc_threshold': BUS_MIN_SOC,
             'feasible': min_soc_overall >= BUS_MIN_SOC,
             'total_energy_charged_wh': total_energy_charged,
-            'bus_statistics': bus_stats
+            'bus_statistics': bus_stats,
+            'dynamic_charging': {
+                'total_dynamic_events': len(dynamic_events),
+                'segment_events': len(segment_events),
+                'stop_events': len(stop_events),
+                'layover_dynamic_events': len(layover_dynamic_events),
+                'segment_energy_wh': sum(e['energy_wh'] for e in segment_events),
+                'stop_energy_wh': sum(e['energy_wh'] for e in stop_events),
+                'layover_dynamic_energy_wh': sum(e['energy_wh'] for e in layover_dynamic_events),
+            },
         }
 
     def print_first_layovers(self, num_to_print: int = 5):
@@ -2192,6 +2468,17 @@ def run_terminal_charging_simulation(sim, bus_trips_dict, bus_lines, trip_change
     print(f"Total layovers: {results['num_layovers']}")
     print(f"Total preemptions: {results['num_preemptions']}")
     print(f"Total energy charged: {results['total_energy_charged_wh']/1e6:,.3f} MWh")
+
+    dyn = results.get('dynamic_charging', {})
+    if dyn.get('total_dynamic_events', 0) > 0:
+        print(f"\nDYNAMIC EN-ROUTE CHARGING:")
+        print(f"  Total dynamic events: {dyn['total_dynamic_events']}")
+        print(f"  Segment charging events: {dyn['segment_events']} "
+              f"({dyn['segment_energy_wh']/1000:,.1f} kWh)")
+        print(f"  Stop charging events: {dyn['stop_events']} "
+              f"({dyn['stop_energy_wh']/1000:,.1f} kWh)")
+        print(f"  Layover dynamic events: {dyn['layover_dynamic_events']} "
+              f"({dyn['layover_dynamic_energy_wh']/1000:,.1f} kWh)")
 
     print("\n" + "="*70)
 

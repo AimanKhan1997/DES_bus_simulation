@@ -198,6 +198,12 @@ The simulation generates the following plots (saved as PNG at 300 DPI):
 
 - **MAP (Mobile Access Point)**: A mobile charging unit that travels between stops to charge buses en route. MAPs have their own battery and can self-charge at designated locations.
 - **Terminal Charging**: Charging that occurs only at terminal (end-of-line) stops during bus layovers.
+- **Dynamic En-Route Charging**: MAPs can charge buses dynamically at any location — during segments (between stops), at stops, and during layovers. When a bus requests a charge, a MAP travels to it and stays attached, charging continuously until the desired SOC level is reached. See [`README_integration_stage2.md`](README_integration_stage2.md) for details.
 - **Preemptive Charging**: Interrupting a bus's trip schedule to perform emergency charging when SOC drops critically low.
-- **Rolling-Horizon Scheduling**: An advanced heuristic that dynamically adjusts charging thresholds based on predicted future energy needs rather than using fixed SOC thresholds.
+- **Rolling-Horizon Scheduling**: An advanced heuristic that dynamically adjusts charging thresholds based on predicted future energy needs rather than using fixed SOC thresholds. See [`README_advanced_heuristics.md`](README_advanced_heuristics.md) for details.
 - **Overnight Charging**: Depot charging that occurs during off-service hours, with infrastructure costs based on tiered charger pricing ($/kW).
+
+## Module Documentation
+
+- **[`README_integration_stage2.md`](README_integration_stage2.md)** — Detailed documentation for the Stage 2 DES simulation, including dynamic en-route MAP charging at segments, stops, and layovers.
+- **[`README_advanced_heuristics.md`](README_advanced_heuristics.md)** — Documentation for the rolling-horizon MAP scheduling algorithm with dynamic thresholds, priority scoring, and MAP selection.
