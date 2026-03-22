@@ -383,8 +383,8 @@ class AdvancedMAPScheduler:
         if self.num_maps <= 0:
             return None
 
-        # Dynamic charging mode: MAP will follow the bus, no fixed window
-        is_dynamic = (layover_duration_s <= 0)
+        # Dynamic en-route charging mode: MAP will follow the bus, no fixed window
+        is_enroute_charging = (layover_duration_s <= 0)
 
         best_map = None
         best_score = -1.0
@@ -403,7 +403,7 @@ class AdvancedMAPScheduler:
                 map_loc, stop_id
             )
 
-            if is_dynamic:
+            if is_enroute_charging:
                 # Dynamic mode: MAP follows the bus, so deliverable is
                 # the full available MAP energy (no time window limit)
                 deliverable = avail
