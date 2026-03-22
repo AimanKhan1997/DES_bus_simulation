@@ -51,6 +51,112 @@ decide_charging(bus_id, soc, capacity, ...)
 
 ---
 
+## Flowchart: `decide_charging()` Logic
+
+The following flowchart shows the complete decision flow when `decide_charging()` is called at every layover, stop, or segment where a bus may need charging.
+
+```mermaid
+flowchart TD
+    START([decide_charging called\nbus_id, soc, capacity, stop_id, ...]) --> CHECK_MAPS{num_maps > 0?}
+    CHECK_MAPS -- No --> NO_MAPS[Return: should_charge=False\nreason: No MAPs available]
+    CHECK_MAPS -- Yes --> STEP1
+
+    %% ── Step 1: Remaining Energy ──
+    subgraph STEP1 [Step 1 — Remaining Energy Estimation]
+        RE1[_remaining_energy bus_id, current_time]
+        RE2[Sum energy of all trips\nstarting after current_time]
+        RE3[remaining_energy_wh]
+        RE1 --> RE2 --> RE3
+    end
+    STEP1 --> STEP2
+
+    %% ── Step 2: Dynamic Thresholds ──
+    subgraph STEP2 [Step 2 — Dynamic Thresholds]
+        DT_CAP{capacity > 0?}
+        DT_CAP -- No --> DT_FALLBACK[Use fallback: start=70%, target=80%]
+        DT_CAP -- Yes --> DT_TRIPS[Get remaining trips list]
+        DT_TRIPS --> DT_COUNT{trip_count == 0?}
+        DT_COUNT -- Yes --> DT_NOCHG[start=100%, target=100%\nNo more trips: skip charging]
+        DT_COUNT -- No --> DT_LOOK[Look-ahead: sum energy\nof next 2 trips]
+        DT_LOOK --> DT_SAFE[min_safe_soc =\n20% × capacity + look-ahead energy]
+        DT_SAFE --> DT_START[start_ratio =\nclamp min_safe_soc/capacity\nbetween 25% and 95%]
+        DT_START --> DT_BUF[Buffer = avg_trip_energy × min 3 trips]
+        DT_BUF --> DT_TARGET[target_ratio =\nclamp buffer_soc/capacity\nbetween start+5% and 95%]
+    end
+    DT_FALLBACK --> COMPARE
+    DT_NOCHG --> COMPARE
+    DT_TARGET --> COMPARE
+
+    COMPARE{soc_ratio >= start_ratio?}
+    COMPARE -- Yes --> NO_CHARGE[Return: should_charge=False\nreason: SOC above dynamic threshold]
+    COMPARE -- No --> STEP3
+
+    %% ── Step 3: Priority Scoring ──
+    subgraph STEP3 [Step 3 — Priority Scoring]
+        P1[SOC Urgency — 40% weight\nExponential boost near 20% floor\n2x if SOC < 30%]
+        P2[Energy Shortfall — 30% weight\nremaining_energy - soc / capacity\nHigher when bus cannot finish day]
+        P3[Line Fairness — 15% weight\n1 / 1+line_charge_count\nUnderserved lines boosted]
+        P4[System Contention — 15% weight\nCount buses with SOC < 50%\nBoost when demand exceeds MAPs]
+        P1 --> PSUM[priority = weighted sum of 4 factors]
+        P2 --> PSUM
+        P3 --> PSUM
+        P4 --> PSUM
+    end
+    STEP3 --> STEP4
+
+    %% ── Step 4: MAP Selection ──
+    subgraph STEP4 [Step 4 — Select Best MAP]
+        M_MODE{layover_duration <= 0?\nen-route mode?}
+        M_MODE -- Yes --> M_ENROUTE[En-route mode:\ndeliverable = full MAP energy\nNo travel-time check]
+        M_MODE -- No --> M_LAYOVER[Layover mode:\nCheck travel_time < 90% of layover\ndeliverable = min avail, remaining_time × rate]
+        M_ENROUTE --> M_LOOP
+        M_LAYOVER --> M_LOOP
+
+        M_LOOP[For each MAP:\nCheck available & has energy]
+        M_LOOP --> M_SCORE[Score 6 criteria:\n• Distance 25%\n• Deliverable 25%\n• Energy level 20%\n• Fairness 10%\n• Urgency 10%\n• Conservation 10%]
+        M_SCORE --> M_BEST[Select MAP with\nhighest score]
+    end
+    STEP4 --> M_CHECK{MAP found?}
+    M_CHECK -- No --> NO_MAP[Return: should_charge=False\nreason: No MAP with sufficient energy]
+    M_CHECK -- Yes --> STEP5
+
+    %% ── Step 5: Target SOC ──
+    subgraph STEP5 [Step 5 — Compute Target SOC]
+        T1[target_full =\nsoc + energy_gap_to_finish_day]
+        T2[target_generous =\n90% × capacity]
+        T3_MODE{en-route mode?}
+        T3_MODE -- Yes --> T3A[target_feasible =\nsoc + full MAP energy]
+        T3_MODE -- No --> T3B[target_feasible =\nsoc + min MAP_energy,\nlayover_time × rate]
+        T3A --> T_MIN[target = min of all three]
+        T3B --> T_MIN
+        T1 --> T_MIN
+        T2 --> T_MIN
+        T_MIN --> T_FLOOR[Enforce floor:\ntarget >= soc + 2% capacity]
+        T_FLOOR --> T_CAP[Hard cap:\ntarget <= bus capacity]
+    end
+
+    STEP5 --> RESULT([Return ChargingDecision:\nshould_charge=True\nmap_id, target_soc_wh\npriority, reason])
+
+    %% Styling
+    style NO_MAPS fill:#f9a8a8,color:#000
+    style NO_CHARGE fill:#f9dca8,color:#000
+    style NO_MAP fill:#f9a8a8,color:#000
+    style RESULT fill:#a8f9a8,color:#000
+    style START fill:#a8c8f9,color:#000
+```
+
+### Reading the Flowchart
+
+1. **Entry**: `decide_charging()` is called whenever a bus arrives at a layover, stop, or segment decision point.
+2. **Step 1**: The scheduler estimates how much energy the bus still needs for all remaining trips today.
+3. **Step 2**: Dynamic thresholds determine whether charging is needed *now*. Unlike the fixed 70%/80% greedy thresholds, these adapt to how many and how energy-intensive the upcoming trips are. If the current SOC is already above the dynamic start threshold, no charging occurs.
+4. **Step 3**: If charging is needed, a priority score is computed. This is used when multiple buses compete for limited MAPs — the highest-priority bus gets served first.
+5. **Step 4**: The scheduler evaluates every available MAP using six weighted criteria and picks the best one. In en-route mode (dynamic charging during segments), the travel-time feasibility check is relaxed because the MAP follows the bus.
+6. **Step 5**: The target SOC is set to the minimum of three candidates — enough to finish the day, a generous 90% cap, and what the MAP can actually deliver — ensuring no energy is wasted.
+7. **Output**: A `ChargingDecision` object tells the simulation whether to charge, which MAP to use, and to what SOC level.
+
+---
+
 ## Key Class: `AdvancedMAPScheduler`
 
 ### Constructor
