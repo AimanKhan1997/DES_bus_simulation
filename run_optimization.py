@@ -120,6 +120,7 @@ def diagnose_infeasibility(results, bus_stats):
                 'type': 'bus_min_cap',
                 'line_id': lid,
                 'value': new_min,
+                'num_maps_at_creation': results.get('num_maps', 0),
                 'reason': (f"Line {lid}: buses reached {ratio*100:.1f}% SOC "
                            f"(< 20%).  Increasing min battery to {new_min} kWh."),
             })
@@ -147,6 +148,130 @@ def diagnose_infeasibility(results, bus_stats):
         })
 
     return constraints
+
+
+def relax_bus_capacity_cuts(feedback_constraints, new_num_maps, prev_num_maps,
+                            bus_cap_min_kwh=50.0):
+    """
+    Relax bus_min_cap constraints when the MAP fleet grows.
+
+    More MAPs can compensate for smaller batteries, so when the MAP fleet
+    increases we reduce existing bus capacity lower bounds proportionally.
+    Cuts that were created with fewer MAPs are relaxed the most.
+
+    Parameters
+    ----------
+    feedback_constraints : list[dict]
+        Current list of feedback constraints.
+    new_num_maps : int
+        MAP fleet size recommended by the latest MILP solution.
+    prev_num_maps : int or None
+        MAP fleet size in the previous iteration (None on first call).
+    bus_cap_min_kwh : float
+        Absolute minimum bus capacity (kWh).  Relaxation never goes below this.
+
+    Returns
+    -------
+    list[dict]  Updated constraint list with relaxed bus_min_cap values.
+    """
+    if prev_num_maps is None or new_num_maps <= prev_num_maps:
+        return feedback_constraints
+
+    relaxed = []
+    for fc in feedback_constraints:
+        if fc['type'] == 'bus_min_cap':
+            old_val = fc['value']
+            maps_at_creation = fc.get('num_maps_at_creation', prev_num_maps)
+            # Relaxation factor: the more the MAP fleet grew relative to the
+            # fleet size when this cut was created, the larger the relaxation.
+            map_ratio = new_num_maps / max(1, maps_at_creation)
+            # Each doubling of the MAP fleet allows ~30 % battery reduction.
+            relax_factor = max(0.5, 1.0 / (1.0 + 0.3 * (map_ratio - 1.0)))
+            new_val = max(bus_cap_min_kwh,
+                          round(old_val * relax_factor / 10) * 10)
+            if new_val < old_val:
+                relaxed.append({
+                    **fc,
+                    'value': new_val,
+                    'reason': (fc['reason']
+                               + f" [Relaxed {old_val}→{new_val} kWh,"
+                               f" MAPs {maps_at_creation}→{new_num_maps}]"),
+                })
+                print(f"  RELAX: bus_min_cap line {fc.get('line_id','?')}"
+                      f" {old_val}→{new_val} kWh"
+                      f" (MAP fleet {maps_at_creation}→{new_num_maps})")
+            else:
+                relaxed.append(fc)
+        else:
+            relaxed.append(fc)
+
+    return relaxed
+
+
+def generate_optimality_cuts(results, stage2_sim, milp_results):
+    """
+    Generate optimality cuts capturing the bus-capacity / MAP-fleet tradeoff.
+
+    When a feasible simulation is found with bus capacities ``B_l*`` and
+    ``N_map*`` MAPs, this function estimates how much bus capacity one
+    additional MAP effectively replaces on each line.  The resulting cut
+
+        B_l  +  γ_l · N_map  ≥  threshold_l
+
+    allows the MILP to explore configurations with smaller batteries
+    compensated by more MAPs, or vice-versa.
+
+    Parameters
+    ----------
+    results : dict
+        Simulation results (from ``run_terminal_charging_simulation``).
+    stage2_sim : Stage2DESTerminalChargingPreemptive
+        The simulation object (provides ``bus_energy_charged``).
+    milp_results : dict
+        MILP solution dict (``bus_battery_kwh``, ``num_maps``, …).
+
+    Returns
+    -------
+    list[dict]  Optimality-cut constraint dicts.
+    """
+    cuts = []
+    num_maps = milp_results.get('num_maps', 0)
+    if num_maps <= 0:
+        return cuts
+
+    bus_caps_kwh = milp_results.get('bus_battery_kwh', {})
+    bus_stats = results.get('bus_statistics', {})
+
+    # Aggregate per-line charging from MAPs
+    line_charged_wh = {}   # {line_id: total_energy_charged_wh}
+    line_bus_count = {}    # {line_id: count}
+    for bus_id, stats in bus_stats.items():
+        lid = stats['line_id']
+        charged = stage2_sim.bus_energy_charged.get(bus_id, 0.0)
+        line_charged_wh[lid] = line_charged_wh.get(lid, 0.0) + charged
+        line_bus_count[lid] = line_bus_count.get(lid, 0) + 1
+
+    for lid, cap_kwh in bus_caps_kwh.items():
+        n_buses = line_bus_count.get(lid, 1)
+        total_charged = line_charged_wh.get(lid, 0.0)
+
+        # γ_l : kWh of bus capacity that one MAP effectively replaces
+        # (average charging delivered per bus per MAP, converted to kWh)
+        gamma = total_charged / max(1, n_buses) / max(1, num_maps) / 1000.0
+
+        if gamma > 0:
+            threshold = cap_kwh + gamma * num_maps
+            cuts.append({
+                'type': 'optimality_cut',
+                'line_id': lid,
+                'gamma': gamma,
+                'threshold': threshold,
+                'reason': (f"Optimality cut line {lid}: "
+                           f"B_{lid} + {gamma:.1f}·N_map ≥ {threshold:.1f} "
+                           f"(feasible B={cap_kwh:.0f} kWh, N={num_maps})."),
+            })
+
+    return cuts
 
 
 def run_milp_simulation_loop(sim, bus_trips, bus_lines, trip_change_stops,
@@ -178,6 +303,7 @@ def run_milp_simulation_loop(sim, bus_trips, bus_lines, trip_change_stops,
     feedback_constraints = []
     iteration_log = []
     best_feasible = None
+    prev_num_maps = initial_num_maps  # track MAP fleet for cut relaxation
 
     # --- Iteration 0: simulate with user-provided start values ---
     print("\n" + "=" * 70)
@@ -261,6 +387,12 @@ def run_milp_simulation_loop(sim, bus_trips, bus_lines, trip_change_stops,
         milp_map_cap_kwh = milp_results['map_battery_kwh']      # kWh
         milp_num_maps = milp_results['num_maps']
 
+        # --- Relax bus capacity cuts when MAP fleet grows ---
+        if milp_num_maps > prev_num_maps:
+            feedback_constraints = relax_bus_capacity_cuts(
+                feedback_constraints, milp_num_maps, prev_num_maps)
+        prev_num_maps = milp_num_maps
+
         # Round MAP battery to nearest step of 10 (it should already be,
         # but ensure integer arithmetic).
         milp_map_cap_kwh = round(milp_map_cap_kwh / 10) * 10
@@ -341,6 +473,22 @@ def run_milp_simulation_loop(sim, bus_trips, bus_lines, trip_change_stops,
                 'reason': (f"Searching for solution cheaper than "
                            f"${best_cost:,.0f}."),
             })
+
+            # --- Generate optimality cuts ---
+            # These capture the bus-capacity / MAP-fleet tradeoff so the
+            # MILP can explore smaller batteries with more MAPs (or vice
+            # versa) instead of only increasing batteries.
+            opt_cuts = generate_optimality_cuts(results, stage2_sim,
+                                                milp_results)
+            # Replace previous optimality cuts with the latest ones
+            # (they are always re-derived from the most recent simulation).
+            feedback_constraints = [
+                fc for fc in feedback_constraints
+                if fc.get('type') != 'optimality_cut'
+            ]
+            for oc in opt_cuts:
+                print(f"  OPT CUT: {oc['reason']}")
+                feedback_constraints.append(oc)
 
             # Re-run MILP with tighter cost bound
             try:
