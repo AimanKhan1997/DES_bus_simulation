@@ -367,18 +367,40 @@ def run_milp_optimization(sim_data,
 
     # 1. Bus SOC ≥ 20%  (per bus, with penalty slack)
     #    deficit(b) = sim_capacity_for_line − min_soc_wh(b)
-    #    new_min_soc(b) = B_l·1000 − deficit(b)
+    #    new_min_soc(b) = B_l·1000 − deficit(b) + map_charging_credit
     #    require: new_min_soc(b) ≥ 0.20 · B_l·1000  ⟹
-    #      (1−0.20)·B_l·1000 ≥ deficit(b) − s_bus(b)
+    #      (1−0.20)·B_l·1000 ≥ deficit(b) − map_credit − s_bus(b)
+    #
+    # The MAP charging credit makes the deficit a function of MAP capacity
+    # rather than frozen from one simulation.  For each bus, the credit is
+    # proportional to how the total MAP capacity (W) changes relative to
+    # the simulation baseline.
+    sim_total_map_cap_wh = sim_num_maps * sim_map_battery_wh
+
     for bus_id in bus_ids:
         bdata = per_bus[bus_id]
         lid = bdata['line_id']
         bus_sim_cap = bdata['sim_battery_wh']
         deficit = bus_sim_cap - bdata['min_soc_wh']
 
+        # Per-bus MAP charging credit rate:
+        #   How much energy this bus received from MAPs per Wh of total MAP
+        #   capacity.  As MAP capacity grows, the bus receives proportionally
+        #   more charging, reducing its effective deficit.
+        per_bus_charged = bdata.get('energy_charged_wh', 0.0)
+        if sim_total_map_cap_wh > 0:
+            charging_rate = per_bus_charged / sim_total_map_cap_wh
+        else:
+            charging_rate = 0.0
+
+        # map_credit = charging_rate × (W×1000 − baseline)
+        #   positive when MAP capacity increases → deficit shrinks
+        #   negative when MAP capacity decreases → deficit grows
+        map_credit = charging_rate * (W * 1000 - sim_total_map_cap_wh)
+
         model.addConstr(
             (1.0 - BUS_MIN_SOC_FRACTION) * B[lid] * 1000
-            - deficit + s_bus[bus_id] >= 0,
+            - deficit + map_credit + s_bus[bus_id] >= 0,
             name=f"bus_soc_{bus_id}")
 
         # link slack → violation indicator
@@ -436,6 +458,16 @@ def run_milp_optimization(sim_data,
             elif fc_type == 'min_maps':
                 model.addConstr(N_map >= fc_val,
                                 name=f"fb_min_maps_{i}")
+            elif fc_type == 'optimality_cut':
+                # Tradeoff cut:  B_l + γ · N_map ≥ threshold
+                # Allows the MILP to trade smaller batteries for more MAPs.
+                lid = fc.get('line_id', '')
+                gamma = fc.get('gamma', 0.0)
+                threshold = fc.get('threshold', 0.0)
+                if lid in B and gamma > 0:
+                    model.addConstr(
+                        B[lid] + gamma * N_map >= threshold,
+                        name=f"fb_opt_cut_{lid}_{i}")
 
     # ---------------------------------------------------------------
     # Objective
