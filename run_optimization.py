@@ -178,6 +178,10 @@ def relax_bus_capacity_cuts(feedback_constraints, new_num_maps, prev_num_maps,
         return feedback_constraints
 
     relaxed = []
+    # Relaxation tuning constants
+    MIN_RELAX_FACTOR = 0.5     # never reduce a cut below 50 % of its value
+    RELAX_PER_DOUBLING = 0.3   # each MAP-fleet doubling relaxes ~30 %
+
     for fc in feedback_constraints:
         if fc['type'] == 'bus_min_cap':
             old_val = fc['value']
@@ -185,8 +189,8 @@ def relax_bus_capacity_cuts(feedback_constraints, new_num_maps, prev_num_maps,
             # Relaxation factor: the more the MAP fleet grew relative to the
             # fleet size when this cut was created, the larger the relaxation.
             map_ratio = new_num_maps / max(1, maps_at_creation)
-            # Each doubling of the MAP fleet allows ~30 % battery reduction.
-            relax_factor = max(0.5, 1.0 / (1.0 + 0.3 * (map_ratio - 1.0)))
+            relax_factor = max(MIN_RELAX_FACTOR,
+                               1.0 / (1.0 + RELAX_PER_DOUBLING * (map_ratio - 1.0)))
             new_val = max(bus_cap_min_kwh,
                           round(old_val * relax_factor / 10) * 10)
             if new_val < old_val:
@@ -257,7 +261,7 @@ def generate_optimality_cuts(results, stage2_sim, milp_results):
 
         # γ_l : kWh of bus capacity that one MAP effectively replaces
         # (average charging delivered per bus per MAP, converted to kWh)
-        gamma = total_charged / max(1, n_buses) / max(1, num_maps) / 1000.0
+        gamma = total_charged / (max(1, n_buses) * max(1, num_maps) * 1000.0)
 
         if gamma > 0:
             threshold = cap_kwh + gamma * num_maps

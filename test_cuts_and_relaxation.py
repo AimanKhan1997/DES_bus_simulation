@@ -197,7 +197,7 @@ class TestGenerateOptimalityCuts(unittest.TestCase):
         )
         cuts = generate_optimality_cuts(results, sim, milp)
         self.assertEqual(len(cuts), 1)
-        expected_gamma = 20_000 / 1 / 2 / 1000  # = 10 kWh per MAP
+        expected_gamma = 20_000 / (1 * 2 * 1000)  # = 10 kWh per MAP
         self.assertAlmostEqual(cuts[0]['gamma'], expected_gamma, places=2)
 
     def test_no_charging_no_cuts(self):
