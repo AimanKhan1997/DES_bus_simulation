@@ -6,8 +6,8 @@ import math
 import sys
 import types
 import unittest
-from unittest.mock import MagicMock
 from collections import defaultdict
+from unittest.mock import MagicMock
 
 # Stub heavy transitive dependencies so we can import run_optimization
 # without installing the full simulation stack.

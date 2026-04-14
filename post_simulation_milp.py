@@ -425,17 +425,20 @@ def run_milp_optimization(sim_data,
     # where MAP_DELIVERY_EFFICIENCY is a conservative operational fraction
     # that accounts for MAP movement overhead, scheduling gaps, and the
     # energy MAPs need for self-charging.
-    physical_delivery_factor = MAP_DELIVERY_EFFICIENCY * (1.0 - MAP_MIN_SOC_FRACTION)
+    # Physical upper bound on MAP delivery efficiency:
+    # MAP fleet can deliver at most this fraction of its total usable capacity.
+    # This accounts for movement overhead, scheduling gaps, and self-charging.
+    max_physical_delivery_factor = MAP_DELIVERY_EFFICIENCY * (1.0 - MAP_MIN_SOC_FRACTION)
 
     if sim_num_maps > 0 and sim_map_battery_wh > 0:
         sim_calibrated_factor = total_energy_charged / (sim_num_maps * sim_map_battery_wh)
         # Take minimum: use simulation evidence but never exceed physical bound
-        effective_delivery_factor = min(sim_calibrated_factor, physical_delivery_factor)
+        effective_delivery_factor = min(sim_calibrated_factor, max_physical_delivery_factor)
     else:
         # No historical calibration data — rely on the physical bound alone.
         # This avoids the previous forced-zero that prevented MAPs from being
         # credited when the prior run happened to use no MAPs.
-        effective_delivery_factor = physical_delivery_factor
+        effective_delivery_factor = max_physical_delivery_factor
 
     # Self-charge scaling factor: relates self-charge energy to MAP sizing.
     # This adds to overnight cost, so keeping it at 0 when sim had no MAPs
@@ -577,7 +580,7 @@ def run_milp_optimization(sim_data,
     # When the prior simulation had NO MAPs (sim_total_map_cap_wh = 0),
     # the old code set charging_rate = 0, making MAPs appear useless.
     # We now fall back to a conservative physical estimate:
-    #   charging_rate_physical = physical_delivery_factor / total_num_buses
+    #   charging_rate_physical = max_physical_delivery_factor / total_num_buses
     # This ensures that even with no prior MAP data, the MILP can explore
     # configurations where MAPs reduce individual bus battery requirements.
 
@@ -611,7 +614,7 @@ def run_milp_optimization(sim_data,
         else:
             # Physical fallback: assume MAP fleet delivers its effective
             # usable capacity uniformly across all buses.
-            charging_rate = physical_delivery_factor / total_num_buses
+            charging_rate = max_physical_delivery_factor / total_num_buses
 
         # map_credit = charging_rate × (W×1000 − baseline)
         #   > 0 when MAP capacity grows → demand falls
