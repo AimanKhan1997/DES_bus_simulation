@@ -47,6 +47,25 @@ BUS_MIN_SOC_FRACTION = 0.20               # 20% minimum bus SOC
 MAP_MIN_SOC_FRACTION = 0.10               # 10% minimum MAP SOC
 OVERNIGHT_CHARGING_HOURS = 4.0            # hours available for overnight charging
 
+# ========================
+# ENERGY MODEL CONSTANTS
+# (from DES_model.energy_per_meter_for_capacity:
+#   rate = 2.7 - (470 - capacity_kwh) * 0.0005
+#        = 2.465 + 0.0005 * capacity_kwh  Wh/m)
+# ========================
+_EPM_A = 2.465   # Wh/m  – constant term of energy-per-metre formula
+_EPM_B = 0.0005  # Wh/m per kWh of battery capacity – linear term
+
+# Conservative physical fraction of MAP fleet energy that can be
+# delivered to buses in one operating day (accounts for movement
+# overhead, self-charging, and scheduling gaps).
+MAP_DELIVERY_EFFICIENCY = 0.45
+
+# Minimum dwell time (seconds) between consecutive trips that counts
+# as a charging opportunity when computing the worst-case inter-charge
+# trip-chain distance.
+_LAYOVER_THRESHOLD_S = 600  # 10 minutes
+
 
 def get_overnight_charger_cost_per_kw(charger_power_kw):
     """
@@ -71,6 +90,119 @@ def get_overnight_charger_cost_per_kw(charger_power_kw):
         return 600.0
     else:
         return 600.0
+
+
+# ========================
+# STATIC DEMAND HELPERS
+# ========================
+
+def compute_static_line_demand(stage2_sim):
+    """Compute worst-case inter-charge trip-chain distance (metres) per line.
+
+    This is independent of any battery capacity used in the simulation — it
+    is derived purely from the GTFS schedule geometry.  The result is used
+    to build bus SOC feasibility constraints that do not depend on the
+    starting values of the optimisation loop.
+
+    Algorithm
+    ---------
+    For each bus the trip chain is walked in chronological order.  When the
+    dwell time between two consecutive trips is at least ``_LAYOVER_THRESHOLD_S``
+    seconds the chain is broken (charging opportunity at the terminal).  The
+    worst-case distance across all chains and all buses on a line is returned.
+
+    Parameters
+    ----------
+    stage2_sim : Stage2DESTerminalChargingPreemptive
+        The simulation object (provides ``bus_trips_dict`` and ``sim``).
+
+    Returns
+    -------
+    dict  ``{line_id: worst_case_chain_distance_m}``
+        Returns an empty dict if GTFS data is unavailable.
+    """
+    result: dict = {}
+    try:
+        bus_trips = stage2_sim.bus_trips_dict
+        gtfs = stage2_sim.sim.gtfs
+        geod = stage2_sim.sim.geod
+    except AttributeError:
+        return result
+
+    # Group buses by line_id
+    line_buses: dict = defaultdict(list)
+    for bus_id in bus_trips:
+        try:
+            line_id = bus_id.split('_')[0].replace('line', '')
+        except Exception:
+            continue
+        line_buses[line_id].append(bus_id)
+
+    for line_id, bus_ids in line_buses.items():
+        max_chain_dist = 0.0
+
+        for bus_id in bus_ids:
+            trip_ids = bus_trips.get(bus_id, [])
+
+            # Sort trips chronologically
+            def _start_time(t):
+                seq = gtfs.stop_sequence(t)
+                return seq[0]["arrival"] if seq else float('inf')
+
+            try:
+                sorted_trips = sorted(trip_ids, key=_start_time)
+            except Exception:
+                continue
+
+            # Build per-trip (distance_m, start_time_s, end_time_s) records
+            trip_records = []
+            for trip_id in sorted_trips:
+                try:
+                    seq = gtfs.stop_sequence(trip_id)
+                    if not seq or len(seq) < 2:
+                        continue
+                    dist = 0.0
+                    for i in range(1, len(seq)):
+                        prev, curr = seq[i - 1], seq[i]
+                        try:
+                            _, _, d = geod.inv(
+                                prev["lon"], prev["lat"],
+                                curr["lon"], curr["lat"],
+                            )
+                            dist += abs(d)
+                        except Exception:
+                            pass
+                    trip_records.append(
+                        (dist, seq[0]["arrival"], seq[-1]["arrival"])
+                    )
+                except Exception:
+                    continue
+
+            if not trip_records:
+                continue
+
+            # Walk the trip chain; break on layover ≥ _LAYOVER_THRESHOLD_S
+            chain_dist = trip_records[0][0]
+            worst_bus = chain_dist
+
+            for i in range(1, len(trip_records)):
+                d_i, t_start_i, _ = trip_records[i]
+                _, _, t_end_prev = trip_records[i - 1]
+                layover = t_start_i - t_end_prev
+                if layover >= _LAYOVER_THRESHOLD_S:
+                    # charging opportunity → restart chain
+                    worst_bus = max(worst_bus, chain_dist)
+                    chain_dist = d_i
+                else:
+                    chain_dist += d_i
+
+            worst_bus = max(worst_bus, chain_dist)
+            max_chain_dist = max(max_chain_dist, worst_bus)
+
+        if max_chain_dist > 0.0:
+            result[line_id] = max_chain_dist
+
+    return result
 
 
 # ========================
@@ -187,6 +319,15 @@ def extract_simulation_data(results, stage2_sim, bus_lines):
     total_energy_consumed = sum(b['total_energy_consumed_wh'] for b in per_bus.values())
     total_energy_charged = results['total_energy_charged_wh']
 
+    # --- static line demands (initialisation-independent) ---
+    # Compute worst-case inter-charge trip-chain distances from GTFS geometry.
+    # These are independent of any battery capacity and are used in the MILP
+    # to build SOC feasibility constraints that do not depend on the starting
+    # values of the optimisation loop.
+    static_line_distances = compute_static_line_demand(stage2_sim)
+    for lid, ld in line_data.items():
+        ld['worst_case_distance_m'] = static_line_distances.get(lid, 0.0)
+
     return {
         'per_line': dict(line_data),
         'per_bus': per_bus,
@@ -263,24 +404,51 @@ def run_milp_optimization(sim_data,
         max_map_deficit = max(max_map_deficit,
                               sim_map_battery_wh - mdata['min_soc_wh'])
 
-    # Scaling factor: relates (N_map × B_map) to total energy charged
-    #   E_charged ∝ N_map × usable_energy_per_MAP
-    #   usable_energy_per_MAP ∝ B_map
-    # When the simulation had no MAPs, no historical charging data exists
-    # to calibrate the scaling; set to 0 so the MILP can still add MAPs
-    # but overnight energy stays at total consumption.
-    if sim_num_maps > 0 and sim_map_battery_wh > 0:
-        scaling_factor = (total_energy_charged
-                          / (sim_num_maps * sim_map_battery_wh))
-    else:
-        scaling_factor = 0.0
+    # ------------------------------------------------------------------
+    # MAP delivery scaling
+    # ------------------------------------------------------------------
+    # We express MAP benefit as an UPPER BOUND on E_charged_scaled rather
+    # than as an equality.  This has two advantages:
+    #
+    #   a) When the previous simulation had no MAPs (sim_num_maps == 0) the
+    #      old code forced scaling_factor = 0 and E_charged_scaled ≡ 0,
+    #      making the MILP believe MAPs are useless.  The new approach uses a
+    #      conservative physical bound so MAPs always get credit.
+    #
+    #   b) The upper bound is the MINIMUM of the simulation-calibrated factor
+    #      (when available) and the physical delivery bound, which avoids both
+    #      over-optimism and the start-dependence caused by relying solely on
+    #      calibration from a single run.
+    #
+    # Physical upper bound: MAP fleet can deliver at most
+    #   MAP_DELIVERY_EFFICIENCY × (1 − MAP_MIN_SOC) × W × 1000  Wh
+    # where MAP_DELIVERY_EFFICIENCY is a conservative operational fraction
+    # that accounts for MAP movement overhead, scheduling gaps, and the
+    # energy MAPs need for self-charging.
+    physical_delivery_factor = MAP_DELIVERY_EFFICIENCY * (1.0 - MAP_MIN_SOC_FRACTION)
 
-    # Self-charge scaling factor: relates self-charge energy to MAP sizing
+    if sim_num_maps > 0 and sim_map_battery_wh > 0:
+        sim_calibrated_factor = total_energy_charged / (sim_num_maps * sim_map_battery_wh)
+        # Take minimum: use simulation evidence but never exceed physical bound
+        effective_delivery_factor = min(sim_calibrated_factor, physical_delivery_factor)
+    else:
+        # No historical calibration data — rely on the physical bound alone.
+        # This avoids the previous forced-zero that prevented MAPs from being
+        # credited when the prior run happened to use no MAPs.
+        effective_delivery_factor = physical_delivery_factor
+
+    # Self-charge scaling factor: relates self-charge energy to MAP sizing.
+    # This adds to overnight cost, so keeping it at 0 when sim had no MAPs
+    # is conservative (we never under-count overnight energy).
     if sim_num_maps > 0 and sim_map_battery_wh > 0:
         self_charge_scaling = (total_map_self_charge
                                / (sim_num_maps * sim_map_battery_wh))
     else:
         self_charge_scaling = 0.0
+
+    # Total MAP fleet capacity in the PREVIOUS simulation (Wh).
+    # Used as the reference baseline for the per-bus MAP charging credit.
+    sim_total_map_cap_wh = sim_num_maps * sim_map_battery_wh
 
     # ---------------------------------------------------------------
     # Model
@@ -372,42 +540,94 @@ def run_milp_optimization(sim_data,
     # so 1e7 provides a safe margin without causing numerical issues.
     BIG_M = 1e7
 
+    # Total number of buses (used for physical MAP credit fallback below)
+    total_num_buses = max(1, len(bus_ids))
+
     # 1. Bus SOC ≥ 20%  (per bus, with penalty slack)
-    #    deficit(b) = sim_capacity_for_line − min_soc_wh(b)
-    #    new_min_soc(b) = B_l·1000 − deficit(b) + map_charging_credit
-    #    require: new_min_soc(b) ≥ 0.20 · B_l·1000  ⟹
-    #      (1−0.20)·B_l·1000 ≥ deficit(b) − map_credit − s_bus(b)
     #
-    # The MAP charging credit makes the deficit a function of MAP capacity
-    # rather than frozen from one simulation.  For each bus, the credit is
-    # proportional to how the total MAP capacity (W) changes relative to
-    # the simulation baseline.
-    sim_total_map_cap_wh = sim_num_maps * sim_map_battery_wh
+    # STATIC DEMAND FORMULATION (initialisation-independent)
+    # -------------------------------------------------------
+    # Instead of using the simulation-observed deficit
+    #   deficit(b) = bus_sim_cap − min_soc_wh(b)
+    # which depends on the battery size used in the last simulation run,
+    # we use the worst-case inter-charge trip-chain demand computed purely
+    # from GTFS route geometry:
+    #
+    #   demand_wh(B_l) = chain_dist_m × energy_per_metre(B_l)
+    #                  = chain_dist_m × (_EPM_A + _EPM_B × B_l)
+    #
+    # where _EPM_A = 2.465 Wh/m and _EPM_B = 0.0005 Wh/(m·kWh).
+    # This is linear in B_l (the decision variable), so the constraint
+    # remains an LP/MIP constraint:
+    #
+    #   (1 − 0.20) × B_l × 1000 ≥ demand_wh(B_l) − map_credit − s_bus(b)
+    #   ⟺  [(1−0.20)×1000 − chain_dist_m × _EPM_B] × B_l
+    #       ≥ chain_dist_m × _EPM_A − map_credit − s_bus(b)
+    #
+    # When no GTFS distance is available, we fall back to the simulation
+    # deficit (backward compatibility).
+    #
+    # MAP CREDIT (robust to sim_num_maps = 0)
+    # ----------------------------------------
+    # The per-bus MAP charging credit is:
+    #   map_credit = charging_rate × (W×1000 − baseline)
+    # where charging_rate captures how much of the total MAP capacity
+    # was delivered to this bus in the prior run.
+    #
+    # When the prior simulation had NO MAPs (sim_total_map_cap_wh = 0),
+    # the old code set charging_rate = 0, making MAPs appear useless.
+    # We now fall back to a conservative physical estimate:
+    #   charging_rate_physical = physical_delivery_factor / total_num_buses
+    # This ensures that even with no prior MAP data, the MILP can explore
+    # configurations where MAPs reduce individual bus battery requirements.
 
     for bus_id in bus_ids:
         bdata = per_bus[bus_id]
         lid = bdata['line_id']
-        bus_sim_cap = bdata['sim_battery_wh']
-        deficit = bus_sim_cap - bdata['min_soc_wh']
 
-        # Per-bus MAP charging credit rate:
-        #   How much energy this bus received from MAPs per Wh of total MAP
-        #   capacity.  As MAP capacity grows, the bus receives proportionally
-        #   more charging, reducing its effective deficit.
+        # --- demand term (static, from GTFS geometry) ---
+        chain_dist_m = per_line[lid].get('worst_case_distance_m', 0.0)
+
+        if chain_dist_m > 0.0:
+            # Static demand as a linear function of B_l (kWh):
+            #   demand_wh = chain_dist_m * _EPM_A  +  chain_dist_m * _EPM_B * B_l
+            static_demand_const_wh = chain_dist_m * _EPM_A
+            static_demand_coeff = chain_dist_m * _EPM_B  # multiplies B_l (kWh) → Wh
+            use_static = True
+        else:
+            # Fallback: use simulation-based deficit (capacity-dependent but
+            # kept for lines where GTFS geometry is unavailable)
+            bus_sim_cap = bdata['sim_battery_wh']
+            static_demand_const_wh = bus_sim_cap - bdata['min_soc_wh']
+            static_demand_coeff = 0.0
+            use_static = False
+
+        # --- MAP credit rate ---
         per_bus_charged = bdata.get('energy_charged_wh', 0.0)
         if sim_total_map_cap_wh > 0:
+            # Simulation-calibrated rate: energy delivered to this bus per
+            # unit of total MAP fleet capacity.
             charging_rate = per_bus_charged / sim_total_map_cap_wh
         else:
-            charging_rate = 0.0
+            # Physical fallback: assume MAP fleet delivers its effective
+            # usable capacity uniformly across all buses.
+            charging_rate = physical_delivery_factor / total_num_buses
 
         # map_credit = charging_rate × (W×1000 − baseline)
-        #   positive when MAP capacity increases → deficit shrinks
-        #   negative when MAP capacity decreases → deficit grows
+        #   > 0 when MAP capacity grows → demand falls
+        #   < 0 when MAP capacity shrinks → demand rises
         map_credit = charging_rate * (W * 1000 - sim_total_map_cap_wh)
 
+        # SOC feasibility constraint (linear in B_l):
+        #   (1 − min_soc_fraction) × B_l × 1000
+        #   − (static_demand_const_wh + static_demand_coeff × B_l)
+        #   + map_credit + s_bus ≥ 0
         model.addConstr(
             (1.0 - BUS_MIN_SOC_FRACTION) * B[lid] * 1000
-            - deficit + map_credit + s_bus[bus_id] >= 0,
+            - static_demand_const_wh
+            - static_demand_coeff * B[lid]
+            + map_credit
+            + s_bus[bus_id] >= 0,
             name=f"bus_soc_{bus_id}")
 
         # link slack → violation indicator
@@ -423,10 +643,20 @@ def run_milp_optimization(sim_data,
         name="map_soc")
     model.addConstr(s_map <= BIG_M * v_map, name="map_viol")
 
-    # 3. Scaled energy charged by MAPs
-    #    E_charged_scaled = scaling_factor × W × 1000   (Wh)
-    model.addConstr(E_charged_scaled == scaling_factor * W * 1000,
-                    name="charged_scaling")
+    # 3. MAP delivery energy — physical upper bound (not equality)
+    #
+    # OLD:  E_charged_scaled == scaling_factor × W × 1000
+    #   Problem: when sim_num_maps == 0, scaling_factor was forced to 0 so
+    #   E_charged_scaled ≡ 0 regardless of the MAP fleet the MILP proposes.
+    #
+    # NEW:  E_charged_scaled ≤ effective_delivery_factor × W × 1000
+    #   The MILP maximises E_charged_scaled (reduces overnight cost), so it
+    #   will naturally push E_charged_scaled to its upper bound.  The bound
+    #   is the MINIMUM of the simulation-calibrated factor and the physical
+    #   delivery limit, so it is never over-optimistic AND is always > 0
+    #   even when the prior run had no MAPs.
+    model.addConstr(E_charged_scaled <= effective_delivery_factor * W * 1000,
+                    name="charged_scaling_ub")
 
     # Upper-bound: cannot charge more than consumed
     model.addConstr(E_charged_scaled <= total_energy_consumed,
@@ -660,10 +890,13 @@ def post_simulation_optimize(results, stage2_sim, bus_lines,
 
     print("\nPer-Line Summary:")
     for lid, ldata in sorted(sim_data['per_line'].items()):
+        wc_dist_km = ldata.get('worst_case_distance_m', 0.0) / 1000.0
         print(f"  Line {lid}: {ldata['num_buses']} buses, "
               f"{ldata['total_num_trips']} trips, "
               f"max deficit {ldata['max_energy_deficit_wh'] / 1000:.1f} kWh, "
-              f"total energy {ldata['total_energy_consumed_wh'] / 1e6:.3f} MWh")
+              f"total energy {ldata['total_energy_consumed_wh'] / 1e6:.3f} MWh, "
+              f"worst-chain dist {wc_dist_km:.1f} km"
+              + (" (static)" if wc_dist_km > 0 else " (fallback: sim deficit)"))
 
     if sim_data['per_map']:
         print("\nPer-MAP Summary (simulation):")

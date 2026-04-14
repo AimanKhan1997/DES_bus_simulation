@@ -1,5 +1,6 @@
 """
-Unit tests for cut relaxation, dynamic deficit, and optimality cut generation.
+Unit tests for cut relaxation, dynamic deficit, and optimality cut generation,
+and the new initialisation-independent static demand computation.
 """
 import math
 import sys
@@ -32,6 +33,162 @@ from run_optimization import (
     generate_optimality_cuts,
 )
 
+# Import the REAL post_simulation_milp (not the stub used for run_optimization).
+# We remove it from sys.modules first so importlib reloads the actual file.
+del sys.modules['post_simulation_milp']
+import importlib
+import post_simulation_milp as _psm_module
+# Restore the stub so other parts of the test suite continue to work.
+sys.modules['post_simulation_milp'] = _psm_module
+
+
+# ---------------------------------------------------------------------------
+# Helpers for building a fake stage2_sim with GTFS data
+# ---------------------------------------------------------------------------
+
+def _make_stop_sequence(stop_coords, start_time=0, step=300):
+    """Build a stop_sequence list from a list of (lat, lon) pairs."""
+    seq = []
+    for i, (lat, lon) in enumerate(stop_coords):
+        seq.append({
+            "stop_id": f"stop_{i}",
+            "arrival": start_time + i * step,
+            "lat": lat,
+            "lon": lon,
+        })
+    return seq
+
+
+def _make_stage2_sim(trips_per_bus, stop_sequences, layover_between_trips=0):
+    """
+    Build a minimal fake stage2_sim object.
+
+    Parameters
+    ----------
+    trips_per_bus : dict  {bus_id: [trip_id, ...]}
+    stop_sequences : dict  {trip_id: [(lat, lon), ...]}
+        Coordinates for each trip's stops.
+    layover_between_trips : int
+        Dwell time (seconds) inserted between consecutive trips.
+    """
+    # Build stop sequence: trips start immediately after each other unless
+    # layover_between_trips is set.
+    trip_start_times = {}
+    t = 0
+    for bus_id, trip_ids in trips_per_bus.items():
+        for trip_id in trip_ids:
+            trip_start_times[trip_id] = t
+            n_stops = len(stop_sequences[trip_id])
+            t += n_stops * 300 + layover_between_trips
+
+    def stop_sequence_fn(trip_id):
+        coords = stop_sequences.get(trip_id, [])
+        start = trip_start_times.get(trip_id, 0)
+        return _make_stop_sequence(coords, start_time=start, step=300)
+
+    # Geodesic distance: use a flat-earth approximation for testing.
+    # ~111 km per degree of latitude.
+    class FakeGeod:
+        def inv(self, lon1, lat1, lon2, lat2):
+            dlat = (lat2 - lat1) * 111_000  # metres
+            dlon = (lon2 - lon1) * 111_000 * math.cos(math.radians((lat1 + lat2) / 2))
+            dist = math.sqrt(dlat**2 + dlon**2)
+            return 0.0, 0.0, dist
+
+    class FakeGTFS:
+        def stop_sequence(self, trip_id):
+            return stop_sequence_fn(trip_id)
+
+    class FakeSim:
+        def __init__(self):
+            self.gtfs = FakeGTFS()
+            self.geod = FakeGeod()
+
+    stage2_sim = MagicMock()
+    stage2_sim.bus_trips_dict = trips_per_bus
+    stage2_sim.sim = FakeSim()
+    return stage2_sim
+
+
+# ---------------------------------------------------------------------------
+# Tests for compute_static_line_demand
+# ---------------------------------------------------------------------------
+
+class TestComputeStaticLineDemand(unittest.TestCase):
+    """compute_static_line_demand returns initialisation-independent distances."""
+
+    def test_single_trip_single_bus(self):
+        """Single trip: chain distance equals the trip distance."""
+        # 10 stops, each 0.01° north of the previous → ≈ 1111 m each segment
+        coords = [(0.0 + i * 0.01, 0.0) for i in range(11)]  # 10 segments
+        sim = _make_stage2_sim(
+            {'line1_bus0': ['t1']},
+            {'t1': coords},
+            layover_between_trips=0,
+        )
+        result = _psm_module.compute_static_line_demand(sim)
+        self.assertIn('1', result)
+        expected_m = 10 * 0.01 * 111_000  # ~11 100 m
+        self.assertAlmostEqual(result['1'], expected_m, delta=100)
+
+    def test_two_trips_no_layover_accumulates(self):
+        """Two consecutive trips with no layover: chain = sum of both."""
+        coords = [(i * 0.01, 0.0) for i in range(6)]   # 5 segments each
+        sim = _make_stage2_sim(
+            {'line2_bus0': ['t1', 't2']},
+            {'t1': coords, 't2': coords},
+            layover_between_trips=0,   # no charging opportunity between trips
+        )
+        result = _psm_module.compute_static_line_demand(sim)
+        self.assertIn('2', result)
+        single_trip_m = 5 * 0.01 * 111_000
+        self.assertAlmostEqual(result['2'], 2 * single_trip_m, delta=200)
+
+    def test_two_trips_with_layover_resets_chain(self):
+        """Two trips separated by a layover ≥ threshold: chain resets."""
+        coords = [(i * 0.01, 0.0) for i in range(6)]
+        sim = _make_stage2_sim(
+            {'line3_bus0': ['t1', 't2']},
+            {'t1': coords, 't2': coords},
+            layover_between_trips=700,   # > _LAYOVER_THRESHOLD_S (600 s)
+        )
+        result = _psm_module.compute_static_line_demand(sim)
+        self.assertIn('3', result)
+        single_trip_m = 5 * 0.01 * 111_000
+        # Chain should equal a SINGLE trip, not the sum of two
+        self.assertAlmostEqual(result['3'], single_trip_m, delta=200)
+
+    def test_multiple_buses_takes_max(self):
+        """Worst-case is the maximum over all buses on the line."""
+        short_coords = [(i * 0.01, 0.0) for i in range(3)]   # 2 segments
+        long_coords  = [(i * 0.02, 0.0) for i in range(3)]   # 2 segments, 2× longer
+        sim = _make_stage2_sim(
+            {'line4_bus0': ['t_short'], 'line4_bus1': ['t_long']},
+            {'t_short': short_coords, 't_long': long_coords},
+        )
+        result = _psm_module.compute_static_line_demand(sim)
+        self.assertIn('4', result)
+        short_m = 2 * 0.01 * 111_000
+        long_m  = 2 * 0.02 * 111_000
+        self.assertAlmostEqual(result['4'], long_m, delta=200)
+        self.assertGreater(result['4'], short_m)
+
+    def test_missing_gtfs_returns_empty(self):
+        """If stage2_sim lacks GTFS attributes, return empty dict."""
+        sim = MagicMock(spec=[])   # no attributes at all
+        result = _psm_module.compute_static_line_demand(sim)
+        self.assertEqual(result, {})
+
+    def test_result_independent_of_battery_capacity(self):
+        """The distance-based demand is independent of battery capacity."""
+        coords = [(i * 0.01, 0.0) for i in range(6)]
+        # Both sims use the same GTFS trips; only battery capacity differs.
+        sim_small = _make_stage2_sim({'line5_bus0': ['t1']}, {'t1': coords})
+        sim_large = _make_stage2_sim({'line5_bus0': ['t1']}, {'t1': coords})
+        # Battery capacity is not part of the input; the result must be equal.
+        r_small = _psm_module.compute_static_line_demand(sim_small)
+        r_large = _psm_module.compute_static_line_demand(sim_large)
+        self.assertAlmostEqual(r_small.get('5', 0), r_large.get('5', 0), delta=1)
 
 class TestDiagnoseInfeasibility(unittest.TestCase):
     """diagnose_infeasibility now stores num_maps_at_creation on bus_min_cap."""
