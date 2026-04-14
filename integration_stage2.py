@@ -24,12 +24,11 @@ MAP_CHARGING_RATE_WH_S = 97.22
 BUS_CHARGE_THRESHOLD_SOC = 0.70
 BUS_CHARGE_CUTOFF_SOC = 0.80
 BUS_MIN_SOC = 0.20
-
-MAX_CONCURRENT_CHARGERS = 2
 CHARGER_SPEED_MS = 37.78
 ENERGY_PER_METER_WH = 2.7  # default (for 470 kWh battery)
+ENERGY_PER_METER_MAP_WH = 0.1  # MAPs CONSUMPTION RATE
 
-MAP_BATTERY_CAPACITY_WH = 150000   # 150 kWh per MAP
+MAP_BATTERY_CAPACITY_WH = 110000   # 150 kWh per MAP
 MAP_MIN_SOC = 0.10                 # MAP cannot go below 10% SOC
 MAP_SELF_CHARGE_RATE_WH_S = 233.0  # MAP self-charges at 233 Wh/s
 
@@ -60,6 +59,7 @@ class MAPMovementRecord:
     to_location: str
     distance_m: float
     duration_s: float
+    energy_consumed_wh: float = 0.0  # Energy consumed during movement
     associated_bus_id: Optional[str] = None
 
 @dataclass
@@ -104,6 +104,7 @@ class MAPUsageTracker:
         # Movement tracking (NEW)
         self.map_total_distance_m = defaultdict(float)  # {map_id: total_distance}
         self.map_movement_events = defaultdict(int)  # {map_id: num_movements}
+        self.map_movement_energy_wh = defaultdict(float)  # {map_id: total_movement_energy}
         # MAP SOC history for plotting {map_id: [(time_s, soc_wh)]}
         self.map_soc_history = defaultdict(list)
         # Self-charge event tracking
@@ -151,7 +152,8 @@ class MAPUsageTracker:
 
     def record_movement(self, map_id: int, start_time: float, end_time: float,
                        from_location: str, to_location: str, distance_m: float,
-                       associated_bus_id: Optional[str] = None):
+                       associated_bus_id: Optional[str] = None,
+                       energy_consumed_wh: float = 0.0):
         """Record a MAP movement event"""
         duration = end_time - start_time
         record = MAPMovementRecord(
@@ -162,11 +164,13 @@ class MAPUsageTracker:
             to_location=to_location,
             distance_m=distance_m,
             duration_s=duration,
+            energy_consumed_wh=energy_consumed_wh,
             associated_bus_id=associated_bus_id
         )
         self.movement_records.append(record)
         self.map_total_distance_m[map_id] += distance_m
         self.map_movement_events[map_id] += 1
+        self.map_movement_energy_wh[map_id] += energy_consumed_wh
 
     def get_summary(self) -> Dict:
         """Get summary of MAP usage"""
@@ -174,6 +178,7 @@ class MAPUsageTracker:
         total_energy = sum(self.map_total_energy.values())
         total_time = sum(self.map_total_time.values())
         total_distance = sum(self.map_total_distance_m.values())
+        total_movement_energy = sum(self.map_movement_energy_wh.values())
 
         map_summaries = {}
         for map_id in range(self.num_maps):
@@ -186,7 +191,8 @@ class MAPUsageTracker:
                                         max(1, self.map_num_events[map_id])),
                 'bus_list': sorted(list(self.map_bus_assignments[map_id])),
                 'total_distance_m': self.map_total_distance_m[map_id],
-                'num_movements': self.map_movement_events[map_id]
+                'num_movements': self.map_movement_events[map_id],
+                'movement_energy_wh': self.map_movement_energy_wh[map_id]
             }
 
         return {
@@ -195,7 +201,8 @@ class MAPUsageTracker:
             'num_events': sum(self.map_num_events.values()),
             'map_summaries': map_summaries,
             'total_distance_m': total_distance,
-            'total_movements': sum(self.map_movement_events.values())
+            'total_movements': sum(self.map_movement_events.values()),
+            'total_movement_energy_wh': total_movement_energy
         }
 
     def print_summary(self, battery_capacity_wh: float):
@@ -209,6 +216,7 @@ class MAPUsageTracker:
 
         print(f"\nOverall Statistics:")
         print(f"  Total energy delivered: {summary['total_energy_wh']/1e6:,.3f} MWh")
+        print(f"  Total movement energy: {summary['total_movement_energy_wh']/1e6:,.3f} MWh")
         print(f"  Total charging time: {summary['total_time_s']/3600:,.1f} hours")
         print(f"  Total charging events: {summary['num_events']}")
         print(f"  Total distance traveled: {summary['total_distance_m']/1000:,.1f} km")
@@ -218,17 +226,18 @@ class MAPUsageTracker:
             print(f"  Average energy per event: {summary['total_energy_wh']/summary['num_events']/1000:,.0f} kWh")
 
         print(f"\nPer-MAP Statistics:")
-        print("-"*100)
-        print(f"{'MAP ID':<8} {'Buses':<12} {'Energy (MWh)':<15} {'Time (hrs)':<12} {'Events':<8} {'Distance (km)':<15} {'Movements':<10}")
-        print("-"*100)
+        print("-"*120)
+        print(f"{'MAP ID':<8} {'Buses':<12} {'Energy (MWh)':<15} {'Mvmt Energy (MWh)':<18} {'Time (hrs)':<12} {'Events':<8} {'Distance (km)':<15} {'Movements':<10}")
+        print("-"*120)
 
         for map_id, map_summary in summary['map_summaries'].items():
             energy_mwh = map_summary['total_energy_wh'] / 1e6
+            movement_energy_mwh = map_summary['movement_energy_wh'] / 1e6
             time_hrs = map_summary['total_time_s'] / 3600
             distance_km = map_summary['total_distance_m'] / 1000
 
             print(f"{map_id:<8} {map_summary['buses_charged']:<12} "
-                  f"{energy_mwh:<15.3f} {time_hrs:<12.1f} {map_summary['num_events']:<8} "
+                  f"{energy_mwh:<15.3f} {movement_energy_mwh:<18.3f} {time_hrs:<12.1f} {map_summary['num_events']:<8} "
                   f"{distance_km:<15.1f} {map_summary['num_movements']:<10}")
 
         print(f"\n{'='*70}\n")
@@ -1014,6 +1023,13 @@ class MAPMovementScheduler:
         self.stop_locations = {}
         self.geod = Geod(ellps="WGS84")
 
+        # Idle charging configuration
+        self.idle_charge_threshold = 0.90  # Trigger proactive charging at 90% SOC
+        self.idle_check_interval = 30.0    # Check every 30 seconds for idle MAPs
+        
+        # Start idle charging loop
+        self.env.process(self._idle_charging_loop())
+
     def set_stop_locations(self, stops_df):
         """Set stop coordinate information for distance calculations"""
         try:
@@ -1064,6 +1080,9 @@ class MAPMovementScheduler:
         if travel_time_s > 0:
             # Schedule movement
             def move_process():
+                # Calculate energy consumed during movement (0.1 Wh per meter)
+                energy_consumed_wh = distance_m * ENERGY_PER_METER_MAP_WH
+                
                 yield self.env.timeout(travel_time_s)
 
                 # Update MAP state
@@ -1071,8 +1090,19 @@ class MAPMovementScheduler:
                 map_state.assigned_bus_id = bus_id
                 map_state.arrival_time_at_target_s = float(self.env.now)
                 map_state.distance_traveled_m += distance_m
+                
+                # Deduct energy consumed from MAP battery
+                # Clamp SOC to minimum threshold to ensure MAP never goes below 10% SOC
+                min_soc_wh = MAP_MIN_SOC * map_state.battery_capacity_wh
+                map_state.current_soc_wh = max(min_soc_wh, 
+                                               map_state.current_soc_wh - energy_consumed_wh)
+                
+                # Record SOC change in history
+                if self.map_tracker:
+                    self.map_tracker.map_soc_history[map_id].append(
+                        (float(self.env.now), map_state.current_soc_wh))
 
-                # Record movement
+                # Record movement with energy consumption
                 if self.map_tracker:
                     self.map_tracker.record_movement(
                         map_id=map_id,
@@ -1081,6 +1111,7 @@ class MAPMovementScheduler:
                         from_location=map_state.current_location,
                         to_location=target_location,
                         distance_m=distance_m,
+                        energy_consumed_wh=energy_consumed_wh,
                         associated_bus_id=bus_id
                     )
 
@@ -1153,9 +1184,9 @@ class MAPMovementScheduler:
         start_time = float(self.env.now)
         location = state.current_location
 
-        print(f"  [MAP {map_id}] Self-charging started at t={self.env.now:.0f}s "
-              f"(SOC {state.current_soc_wh/1000:.1f} kWh -> {state.battery_capacity_wh/1000:.1f} kWh, "
-              f"duration {duration:.0f}s)")
+        # print(f"  [MAP {map_id}] Self-charging started at t={self.env.now:.0f}s "
+        #       f"(SOC {state.current_soc_wh/1000:.1f} kWh -> {state.battery_capacity_wh/1000:.1f} kWh, "
+        #       f"duration {duration:.0f}s)")
 
         yield self.env.timeout(duration)
 
@@ -1174,8 +1205,39 @@ class MAPMovementScheduler:
                 soc_after_wh=state.current_soc_wh
             )
 
-        print(f"  [MAP {map_id}] Self-charging complete at t={self.env.now:.0f}s "
-              f"(SOC {state.current_soc_wh/1000:.1f} kWh)")
+        # print(f"  [MAP {map_id}] Self-charging complete at t={self.env.now:.0f}s "
+        #       f"(SOC {state.current_soc_wh/1000:.1f} kWh)")
+
+
+    def _idle_charging_loop(self):
+        """Background process: continuously check for idle MAPs and trigger self-charging.
+        
+        This process runs throughout the simulation and proactively charges MAPs when:
+        - They are not currently charging a bus
+        - They are not already self-charging
+        - Their SOC is below the idle_charge_threshold (default 50%)
+        """
+        while True:
+            yield self.env.timeout(self.idle_check_interval)
+            
+            for map_id in range(self.num_maps):
+                state = self.map_states.get(map_id)
+                if not state:
+                    continue
+                
+                # Skip if already self-charging
+                if self._is_self_charging.get(map_id, False):
+                    continue
+                
+                # Skip if currently assigned to a bus
+                if state.assigned_bus_id is not None:
+                    continue
+                
+                # Check if SOC is below idle charging threshold
+                current_soc_ratio = state.current_soc_wh / state.battery_capacity_wh
+                if current_soc_ratio < self.idle_charge_threshold:
+                    # Trigger self-charging
+                    self.env.process(self.self_charge_process(map_id))
 
     def map_is_at_location(self, map_id: int, location: str) -> bool:
         """Check if a MAP is at a specific location"""
@@ -2010,8 +2072,8 @@ class Stage2DESTerminalChargingPreemptive:
 
         Uses the stop coordinates from the MAP movement scheduler and
         counts the number of self-charge events at each stop.  The OSM
-        road network is rendered as a background layer using osmnx so that
-        the spatial context of the transit system is visible.
+        road network is clipped to the bounding box of bus stops so that
+        only the relevant transit corridor is visible.
         """
         import osmnx as ox
 
@@ -2047,10 +2109,36 @@ class Stage2DESTerminalChargingPreemptive:
             print("No self-charge locations with coordinates found")
             return
 
-        # --- Plot the OSM network as background ---
-        G = self.sim.osm.G
+        # --- Collect ALL bus stop coordinates to define the clipping region ---
+        all_stop_lats = []
+        all_stop_lons = []
+        for stop_id, (slat, slon) in stop_locs.items():
+            all_stop_lats.append(slat)
+            all_stop_lons.append(slon)
+        # Also include the self-charge locations
+        all_stop_lats.extend(lats)
+        all_stop_lons.extend(lons)
+
+        # Compute bounding box with a buffer (~500m ≈ 0.005 degrees)
+        buffer = 0.05
+        north = max(all_stop_lats) + buffer
+        south = min(all_stop_lats) - buffer
+        east = max(all_stop_lons) + buffer
+        west = min(all_stop_lons) - buffer
+
+        # --- Clip the OSM network to the bounding box ---
+        G_full = self.sim.osm.G
+        G_clipped = ox.truncate.truncate_graph_bbox(
+            G_full, bbox=(west, south, east, north)
+        )
+
+        # Fall back to full graph if clipping removes everything
+        if len(G_clipped.nodes) == 0:
+            print("Warning: clipped graph is empty, using full network")
+            G_clipped = G_full
+
         fig, ax = ox.plot_graph(
-            G, figsize=(14, 12), show=False, close=False,
+            G_clipped, figsize=(14, 12), show=False, close=False,
             node_size=0, edge_color='#999999', edge_linewidth=0.5,
             bgcolor='white',
         )
@@ -2070,29 +2158,29 @@ class Stage2DESTerminalChargingPreemptive:
         cbar.set_label('Number of self-charge events', fontweight='bold', fontsize=11)
 
         # Annotate stops with high usage
-        max_count = max(counts)
-        for lon, lat, count, label in zip(lons, lats, counts, labels):
-            if count >= max(2, max_count * 0.5):
-                ax.annotate(
-                    f'{label}\n({count})',
-                    (lon, lat),
-                    textcoords="offset points",
-                    xytext=(8, 8),
-                    fontsize=7,
-                    fontweight='bold',
-                    bbox=dict(boxstyle='round,pad=0.2', facecolor='white',
-                              edgecolor='gray', alpha=0.8),
-                )
+        # max_count = max(counts)
+        # for lon, lat, count, label in zip(lons, lats, counts, labels):
+        #     if count >= max(2, max_count * 0.5):
+        #         ax.annotate(
+        #             f'{label}\n({count})',
+        #             (lon, lat),
+        #             textcoords="offset points",
+        #             xytext=(8, 8),
+        #             fontsize=7,
+        #             fontweight='bold',
+        #             bbox=dict(boxstyle='round,pad=0.2', facecolor='white',
+        #                       edgecolor='gray', alpha=0.8),
+        #         )
 
         ax.set_xlabel('Longitude', fontweight='bold', fontsize=12)
         ax.set_ylabel('Latitude', fontweight='bold', fontsize=12)
-        ax.set_title('MAP Self-Charge Location Heatmap (OSM Network)',
-                      fontweight='bold', fontsize=14)
+        ax.set_title('MAP Self-Charge Location Heatmap (Bus Route Network)',
+                     fontweight='bold', fontsize=14)
 
         total_events = sum(counts)
         num_locations = len(counts)
         ax.text(
-            0.02, 0.98,
+            0.02, 0.92,
             f'Total self-charge events: {total_events}\n'
             f'Unique locations: {num_locations}',
             transform=ax.transAxes,
@@ -2111,7 +2199,7 @@ class Stage2DESTerminalChargingPreemptive:
 # ========================
 
 def run_terminal_charging_simulation(sim, bus_trips_dict, bus_lines, trip_change_stops,
-                                    battery_capacity_wh: float = 250000,
+                                    battery_capacity_wh: float = 50000,
                                     num_maps: int = 1,
                                     optimize_threshold: bool = True,
                                     preemption_threshold: Optional[float] = None,
