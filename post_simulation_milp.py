@@ -207,7 +207,8 @@ def run_milp_optimization(sim_data,
                           bus_cap_max_kwh=500.0,
                           map_cap_min_kwh=50.0,
                           map_cap_max_kwh=500.0,
-                          feedback_constraints=None):
+                          feedback_constraints=None,
+                          surrogate_constraint=None):
     """
     Formulate and solve the post-simulation MILP using Gurobi.
 
@@ -227,6 +228,14 @@ def run_milp_optimization(sim_data,
             'type'    – one of 'bus_min_cap', 'map_min_cap', 'min_maps'
             'line_id' – (for bus_min_cap) which line to constrain
             'value'   – the minimum value to enforce
+    surrogate_constraint : dict or None, optional
+        Linear feasibility constraint learned by :class:`FeasibilitySurrogate`.
+        When provided it is added to the model as a single linear constraint
+        of the form ``sum_i w_i * x_i >= rhs`` where the keys map directly
+        to MILP variable names (``'B_<line_id>'``, ``'B_map'``,
+        ``'N_map'``).  Expected keys:
+            'coefficients' – ``{variable_name: weight}``
+            'rhs'          – scalar right-hand-side value
 
     Returns
     -------
@@ -438,6 +447,48 @@ def run_milp_optimization(sim_data,
                                 name=f"fb_min_maps_{i}")
 
     # ---------------------------------------------------------------
+    # Surrogate feasibility constraint (learned from simulation data)
+    # ---------------------------------------------------------------
+    # The surrogate is a logistic-regression classifier trained on all
+    # previously observed (decision-variable vector, feasible/infeasible)
+    # pairs.  Its linear decision boundary is expressed in the original
+    # (un-scaled) feature space as:
+    #
+    #     sum_i  w_i * x_i  >=  rhs
+    #
+    # Variable names used by the surrogate are:
+    #     'B_<line_id>'  →  B[line_id]   (bus battery, kWh)
+    #     'B_map'        →  B_map        (MAP battery, kWh)
+    #     'N_map'        →  N_map        (number of MAPs)
+    #
+    # This constraint guides the MILP toward the predicted-feasible
+    # half-space without hard-coding any per-line lower bounds.
+    if surrogate_constraint is not None:
+        coeffs = surrogate_constraint.get('coefficients', {})
+        rhs = surrogate_constraint.get('rhs', 0.0)
+
+        # Map surrogate feature names to Gurobi variables
+        _name_to_var = {}
+        for l in line_ids:
+            _name_to_var[f'B_{l}'] = B[l]
+        _name_to_var['B_map'] = B_map
+        _name_to_var['N_map'] = N_map
+
+        lhs_terms = []
+        for feat_name, weight in coeffs.items():
+            var = _name_to_var.get(feat_name)
+            if var is not None and weight != 0.0:
+                lhs_terms.append(weight * var)
+
+        if lhs_terms:
+            model.addConstr(
+                gp.quicksum(lhs_terms) >= rhs,
+                name="surrogate_feasibility",
+            )
+            print(f"\n  Surrogate feasibility constraint added "
+                  f"({len(lhs_terms)} terms, rhs={rhs:.4f})")
+
+    # ---------------------------------------------------------------
     # Objective
     # ---------------------------------------------------------------
     # Calculate overnight charger power tier from simulation data
@@ -565,7 +616,8 @@ def post_simulation_optimize(results, stage2_sim, bus_lines,
                              bus_cap_max_kwh=500.0,
                              map_cap_min_kwh=50.0,
                              map_cap_max_kwh=500.0,
-                             feedback_constraints=None):
+                             feedback_constraints=None,
+                             surrogate_constraint=None):
     """
     Run the post-simulation MILP optimisation.
 
@@ -585,6 +637,9 @@ def post_simulation_optimize(results, stage2_sim, bus_lines,
         Bounds on MAP battery capacity.
     feedback_constraints : list[dict], optional
         Extra constraints from the MILP–simulation feedback loop.
+    surrogate_constraint : dict or None, optional
+        Linear feasibility constraint from :class:`FeasibilitySurrogate`.
+        See :func:`run_milp_optimization` for the expected format.
 
     Returns
     -------
@@ -646,6 +701,7 @@ def post_simulation_optimize(results, stage2_sim, bus_lines,
         map_cap_min_kwh=map_cap_min_kwh,
         map_cap_max_kwh=map_cap_max_kwh,
         feedback_constraints=feedback_constraints,
+        surrogate_constraint=surrogate_constraint,
     )
 
     # --- report ---
