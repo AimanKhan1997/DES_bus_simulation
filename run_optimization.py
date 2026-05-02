@@ -3,7 +3,7 @@ Run Terminal-Only Charging with INTEGRATED Optimized Preemption Strategy
 WITH MILP <-> SIMULATION FEEDBACK LOOP for iterative feasibility search
 
 Modes:
-    --sim-only   Run a single simulation without the MILP loop (validation mode)
+    python run_optimization.py --sim-only   Run a single simulation without the MILP loop (validation mode)
     (default)    Run the MILP <-> simulation feedback loop
 """
 
@@ -12,12 +12,15 @@ from post_simulation_milp import post_simulation_optimize
 from dataclasses import dataclass
 import math
 import sys
+import random
+
 
 @dataclass
 class BusLineData:
     line_id: str
     num_buses: int
     trips_df: object
+
 
 def load_stockholm_data():
     from DES_model import GTFSBusSim
@@ -44,6 +47,7 @@ def load_stockholm_data():
             ))
 
     return sim, bus_lines
+
 
 def compute_trip_change_stops(sim, bus_trips_dict):
     """Compute trip-change stops"""
@@ -84,9 +88,63 @@ def compute_trip_change_stops(sim, bus_trips_dict):
     return trip_change_stops
 
 
+def generate_random_initial_values(bus_lines, min_bus_cap_kwh=50, max_bus_cap_kwh=500,
+                                   min_maps=2, max_maps=20, min_map_cap_kwh=90,
+                                   max_map_cap_kwh=500):
+    """
+    Generate random initial values for LINE_BATTERY_CAPACITIES_KWH, number of MAPs,
+    and MAP battery capacity.
+
+    Parameters
+    ----------
+    bus_lines : list[BusLineData]
+        Bus lines to generate capacities for
+    min_bus_cap_kwh, max_bus_cap_kwh : float
+        Range for per-line bus battery capacities
+    min_maps, max_maps : int
+        Range for number of MAPs
+    min_map_cap_kwh, max_map_cap_kwh : float
+        Range for MAP battery capacity
+
+    Returns
+    -------
+    tuple (line_battery_capacities_wh, initial_capacity_wh, initial_num_maps,
+           map_battery_capacity_wh)
+    """
+    # Random per-line bus battery capacities (in steps of 10 kWh)
+    line_battery_capacities_wh = {}
+    for line in bus_lines:
+        cap_kwh = random.randint(
+            int(min_bus_cap_kwh / 10),
+            int(max_bus_cap_kwh / 10)
+        ) * 10
+        line_battery_capacities_wh[line.line_id] = cap_kwh * 1000
+
+    # Random default capacity (fallback)
+    initial_capacity_wh = random.randint(
+        int(min_bus_cap_kwh / 10),
+        int(max_bus_cap_kwh / 10)
+    ) * 10 * 1000
+
+    # Random number of MAPs
+    initial_num_maps = random.randint(min_maps, max_maps)
+
+    # Random MAP battery capacity (in steps of 10 kWh)
+    map_cap_kwh = random.randint(
+        int(min_map_cap_kwh / 10),
+        int(max_map_cap_kwh / 10)
+    ) * 10
+    map_battery_capacity_wh = map_cap_kwh * 1000
+
+    return line_battery_capacities_wh, initial_capacity_wh, initial_num_maps, map_battery_capacity_wh
+
+
 def diagnose_infeasibility(results, bus_stats):
     """
     Analyze simulation results to determine why the scenario was infeasible.
+
+    IMPROVED: Includes fallback logic to ensure a constraint is always generated
+    when the simulation is infeasible.
 
     Returns a list of feedback constraint dicts that should be added to the
     MILP on the next iteration.  Each dict has:
@@ -99,7 +157,7 @@ def diagnose_infeasibility(results, bus_stats):
     bus_min_soc = 0.20  # 20%
 
     # --- Check per-line bus SOC violations ---
-    line_worst = {}   # {line_id: worst min_soc_ratio}
+    line_worst = {}  # {line_id: worst min_soc_ratio}
     for bus_id, stats in bus_stats.items():
         lid = stats['line_id']
         ratio = stats['min_soc_ratio']
@@ -120,7 +178,8 @@ def diagnose_infeasibility(results, bus_stats):
                 'type': 'bus_min_cap',
                 'line_id': lid,
                 'value': new_min,
-                'reason': (f"Line {lid}: buses reached {ratio*100:.1f}% SOC "
+                'num_maps_at_creation': results.get('num_maps', 0),
+                'reason': (f"Line {lid}: buses reached {ratio * 100:.1f}% SOC "
                            f"(< 20%).  Increasing min battery to {new_min} kWh."),
             })
 
@@ -132,8 +191,8 @@ def diagnose_infeasibility(results, bus_stats):
         constraints.append({
             'type': 'min_maps',
             'value': 1,
-            'reason': (f"Overall min SOC {results['min_soc_overall_ratio']*100:.1f}% "
-                       f"< {bus_min_soc*100:.0f}% with 0 MAPs (charging disabled).  "
+            'reason': (f"Overall min SOC {results['min_soc_overall_ratio'] * 100:.1f}% "
+                       f"< {bus_min_soc * 100:.0f}% with 0 MAPs (charging disabled).  "
                        f"Requiring at least 1 MAP."),
         })
     elif num_maps_cur > 0 and results['min_soc_overall_ratio'] < bus_min_soc:
@@ -141,18 +200,182 @@ def diagnose_infeasibility(results, bus_stats):
         constraints.append({
             'type': 'min_maps',
             'value': num_maps_cur + 1,
-            'reason': (f"Overall min SOC {results['min_soc_overall_ratio']*100:.1f}% "
-                       f"< {bus_min_soc*100:.0f}% despite {num_maps_cur} MAPs.  "
+            'reason': (f"Overall min SOC {results['min_soc_overall_ratio'] * 100:.1f}% "
+                       f"< {bus_min_soc * 100:.0f}% despite {num_maps_cur} MAPs.  "
                        f"Requiring at least {num_maps_cur + 1} MAPs."),
         })
+
+    # --- FALLBACK: If no constraints were generated but simulation is infeasible ---
+    # This handles edge cases where infeasibility wasn't caught above
+    if not constraints and not results.get('feasible', True):
+        # Default: increase bus batteries across all lines
+        print(f"  [DEBUG] Infeasibility diagnosed but no specific cause found.")
+        print(f"  [DEBUG] Min SOC overall: {results['min_soc_overall_ratio'] * 100:.1f}%")
+        print(f"  [DEBUG] Number of MAPs: {num_maps_cur}")
+        print(f"  [DEBUG] Applying fallback: increasing all bus batteries by 20 kWh")
+
+        for lid, ratio in line_worst.items():
+            line_cap_kwh = results.get('line_battery_capacities_wh', {}).get(lid)
+            if line_cap_kwh is not None:
+                line_cap_kwh = line_cap_kwh / 1000
+            else:
+                line_cap_kwh = results['battery_capacity_wh'] / 1000
+            # Fallback: increase by 20 kWh (two steps of 10)
+            new_min = math.ceil((line_cap_kwh + 20) / 10) * 10
+            constraints.append({
+                'type': 'bus_min_cap',
+                'line_id': lid,
+                'value': new_min,
+                'num_maps_at_creation': results.get('num_maps', 0),
+                'reason': (f"Line {lid}: infeasibility detected but cause unclear. "
+                           f"Fallback: increasing min battery to {new_min} kWh."),
+            })
+
+        # If no line-specific data, add a general MAP constraint
+        if not constraints:
+            new_num_maps = max(1, num_maps_cur + 1)
+            constraints.append({
+                'type': 'min_maps',
+                'value': new_num_maps,
+                'reason': (f"Infeasibility detected with no per-line SOC data. "
+                           f"Fallback: requiring at least {new_num_maps} MAPs."),
+            })
 
     return constraints
 
 
+def relax_bus_capacity_cuts(feedback_constraints, new_num_maps, prev_num_maps,
+                            bus_cap_min_kwh=50.0):
+    """
+    Relax bus_min_cap constraints when the MAP fleet grows.
+
+    More MAPs can compensate for smaller batteries, so when the MAP fleet
+    increases we reduce existing bus capacity lower bounds proportionally.
+    Cuts that were created with fewer MAPs are relaxed the most.
+
+    Parameters
+    ----------
+    feedback_constraints : list[dict]
+        Current list of feedback constraints.
+    new_num_maps : int
+        MAP fleet size recommended by the latest MILP solution.
+    prev_num_maps : int or None
+        MAP fleet size in the previous iteration (None on first call).
+    bus_cap_min_kwh : float
+        Absolute minimum bus capacity (kWh).  Relaxation never goes below this.
+
+    Returns
+    -------
+    list[dict]  Updated constraint list with relaxed bus_min_cap values.
+    """
+    if prev_num_maps is None or new_num_maps <= prev_num_maps:
+        return feedback_constraints
+
+    relaxed = []
+    # Relaxation tuning constants
+    MIN_RELAX_FACTOR = 0.5  # never reduce a cut below 50 % of its value
+    RELAX_PER_DOUBLING = 0.3  # each MAP-fleet doubling relaxes ~30 %
+
+    for fc in feedback_constraints:
+        if fc['type'] == 'bus_min_cap':
+            old_val = fc['value']
+            maps_at_creation = fc.get('num_maps_at_creation', prev_num_maps)
+            # Relaxation factor: the more the MAP fleet grew relative to the
+            # fleet size when this cut was created, the larger the relaxation.
+            map_ratio = new_num_maps / max(1, maps_at_creation)
+            relax_factor = max(MIN_RELAX_FACTOR,
+                               1.0 / (1.0 + RELAX_PER_DOUBLING * (map_ratio - 1.0)))
+            new_val = max(bus_cap_min_kwh,
+                          round(old_val * relax_factor / 10) * 10)
+            if new_val < old_val:
+                relaxed.append({
+                    **fc,
+                    'value': new_val,
+                    'reason': (fc['reason']
+                               + f" [Relaxed {old_val}→{new_val} kWh,"
+                                 f" MAPs {maps_at_creation}→{new_num_maps}]"),
+                })
+                print(f"  RELAX: bus_min_cap line {fc.get('line_id', '?')}"
+                      f" {old_val}→{new_val} kWh"
+                      f" (MAP fleet {maps_at_creation}→{new_num_maps})")
+            else:
+                relaxed.append(fc)
+        else:
+            relaxed.append(fc)
+
+    return relaxed
+
+
+def generate_optimality_cuts(results, stage2_sim, milp_results):
+    """
+    Generate optimality cuts capturing the bus-capacity / MAP-fleet tradeoff.
+
+    When a feasible simulation is found with bus capacities ``B_l*`` and
+    ``N_map*`` MAPs, this function estimates how much bus capacity one
+    additional MAP effectively replaces on each line.  The resulting cut
+
+        B_l  +  γ_l · N_map  ≥  threshold_l
+
+    allows the MILP to explore configurations with smaller batteries
+    compensated by more MAPs, or vice-versa.
+
+    Parameters
+    ----------
+    results : dict
+        Simulation results (from ``run_terminal_charging_simulation``).
+    stage2_sim : Stage2DESTerminalChargingPreemptive
+        The simulation object (provides ``bus_energy_charged``).
+    milp_results : dict
+        MILP solution dict (``bus_battery_kwh``, ``num_maps``, …).
+
+    Returns
+    -------
+    list[dict]  Optimality-cut constraint dicts.
+    """
+    cuts = []
+    num_maps = milp_results.get('num_maps', 0)
+    if num_maps <= 0:
+        return cuts
+
+    bus_caps_kwh = milp_results.get('bus_battery_kwh', {})
+    bus_stats = results.get('bus_statistics', {})
+
+    # Aggregate per-line charging from MAPs
+    line_charged_wh = {}  # {line_id: total_energy_charged_wh}
+    line_bus_count = {}  # {line_id: count}
+    for bus_id, stats in bus_stats.items():
+        lid = stats['line_id']
+        charged = stage2_sim.bus_energy_charged.get(bus_id, 0.0)
+        line_charged_wh[lid] = line_charged_wh.get(lid, 0.0) + charged
+        line_bus_count[lid] = line_bus_count.get(lid, 0) + 1
+
+    for lid, cap_kwh in bus_caps_kwh.items():
+        n_buses = line_bus_count.get(lid, 1)
+        total_charged = line_charged_wh.get(lid, 0.0)
+
+        # γ_l : kWh of bus capacity that one MAP effectively replaces
+        # (average charging delivered per bus per MAP, converted to kWh)
+        gamma = total_charged / (max(1, n_buses) * max(1, num_maps) * 1000.0)
+
+        if gamma > 0:
+            threshold = cap_kwh + gamma * num_maps
+            cuts.append({
+                'type': 'optimality_cut',
+                'line_id': lid,
+                'gamma': gamma,
+                'threshold': threshold,
+                'reason': (f"Optimality cut line {lid}: "
+                           f"B_{lid} + {gamma:.1f}·N_map ≥ {threshold:.1f} "
+                           f"(feasible B={cap_kwh:.0f} kWh, N={num_maps})."),
+            })
+
+    return cuts
+
+
 def run_milp_simulation_loop(sim, bus_trips, bus_lines, trip_change_stops,
-                              line_battery_capacities_wh,
-                              initial_capacity_wh, initial_num_maps,
-                              max_iterations=50):
+                             line_battery_capacities_wh,
+                             initial_capacity_wh, initial_num_maps,
+                             max_iterations=100):
     """
     Iterative MILP <-> simulation feedback loop.
 
@@ -178,6 +401,7 @@ def run_milp_simulation_loop(sim, bus_trips, bus_lines, trip_change_stops,
     feedback_constraints = []
     iteration_log = []
     best_feasible = None
+    prev_num_maps = initial_num_maps  # track MAP fleet for cut relaxation
 
     # --- Iteration 0: simulate with user-provided start values ---
     print("\n" + "=" * 70)
@@ -231,13 +455,94 @@ def run_milp_simulation_loop(sim, bus_trips, bus_lines, trip_change_stops,
     consecutive_milp_failures = 0
     MAX_CONSECUTIVE_MILP_FAILURES = 3
 
+    # Track consecutive MILP infeasibility (no solution found)
+    consecutive_milp_infeasible = 0
+    MAX_CONSECUTIVE_MILP_INFEASIBLE = 2
+
+    # Track plateau detection (same objective for 5 consecutive iterations)
+    prev_objective = None
+    consecutive_same_objective = 0
+    MAX_CONSECUTIVE_SAME_OBJECTIVE = 5
+
     # --- Feedback iterations ---
     for iteration in range(1, max_iterations + 1):
         if milp_results is None or milp_results.get('objective_value') is None:
             consecutive_milp_failures += 1
+            consecutive_milp_infeasible += 1
+
+            print(f"\n  [!] MILP Infeasibility #{consecutive_milp_infeasible}")
+
             if consecutive_milp_failures >= MAX_CONSECUTIVE_MILP_FAILURES:
-                print(f"\n[!] MILP returned no solution {MAX_CONSECUTIVE_MILP_FAILURES} times in a row - resetting and continuing.")
+                print(
+                    f"  [!] MILP returned no solution {MAX_CONSECUTIVE_MILP_FAILURES} times in a row - resetting and continuing.")
                 consecutive_milp_failures = 0
+
+            # --- TRIGGER RANDOM RESET when MILP infeasible for consecutive times ---
+            if consecutive_milp_infeasible >= MAX_CONSECUTIVE_MILP_INFEASIBLE:
+                print(f"\n[!] MILP INFEASIBLE {consecutive_milp_infeasible} times - Resetting with random values...")
+
+                # Generate random initial values
+                random_line_caps_wh, random_capacity_wh, random_num_maps, random_map_cap_wh = \
+                    generate_random_initial_values(
+                        bus_lines,
+                        min_bus_cap_kwh=50, max_bus_cap_kwh=500,
+                        min_maps=2, max_maps=20,
+                        min_map_cap_kwh=100, max_map_cap_kwh=500
+                    )
+
+                print(f"    Random values generated:")
+                for lid, cap in sorted({lid: wh / 1000 for lid, wh in random_line_caps_wh.items()}.items()):
+                    print(f"      Line {lid}: {cap:.0f} kWh")
+                print(f"      Number of MAPs: {random_num_maps}")
+                print(f"      MAP battery: {random_map_cap_wh / 1000:.0f} kWh")
+
+                # Run simulation with random values
+                results, stage2_sim = run_terminal_charging_simulation(
+                    sim=sim,
+                    bus_trips_dict=bus_trips,
+                    bus_lines=bus_lines,
+                    trip_change_stops=trip_change_stops,
+                    battery_capacity_wh=random_capacity_wh,
+                    num_maps=random_num_maps,
+                    optimize_threshold=True,
+                    preemption_threshold=None,
+                    simulation_duration_s=86400,
+                    line_battery_capacities_wh=random_line_caps_wh,
+                    map_battery_capacity_wh=random_map_cap_wh,
+                    skip_plots=True,
+                )
+
+                # Clear ALL constraints to give MILP fresh start
+                feedback_constraints = []
+
+                # Reset tracking
+                consecutive_milp_infeasible = 0
+                consecutive_same_objective = 0
+                prev_objective = None
+
+                # Log this random start
+                iteration_log.append({
+                    'iteration': iteration,
+                    'milp_status': 'random_start',
+                    'sim_feasible': results['feasible'],
+                    'bus_battery_kwh': {lid: wh / 1000 for lid, wh in random_line_caps_wh.items()},
+                    'map_battery_kwh': random_map_cap_wh / 1000,
+                    'num_maps': random_num_maps,
+                    'objective': None,
+                })
+
+                # Run MILP with random initial values
+                try:
+                    milp_results = post_simulation_optimize(
+                        results, stage2_sim, bus_lines,
+                        feedback_constraints=feedback_constraints,
+                    )
+                except Exception as e:
+                    print(f"\n[!] MILP error after infeasibility reset: {e}")
+                    milp_results = None
+
+                continue
+
             # Remove the cost_upper_bound so MILP can find any feasible
             # solution on the next pass.
             feedback_constraints = [
@@ -252,14 +557,30 @@ def run_milp_simulation_loop(sim, bus_trips, bus_lines, trip_change_stops,
             except Exception as e:
                 print(f"\n[!] MILP error during retry: {e}")
                 milp_results = None
+            iteration_log.append({
+                'iteration': iteration,
+                'milp_status': 'MILP_retry',
+                'sim_feasible': False,
+                'bus_battery_kwh': None,
+                'map_battery_kwh': None,
+                'num_maps': None,
+                'objective': None,
+            })
             continue
 
         consecutive_milp_failures = 0  # reset on success
+        consecutive_milp_infeasible = 0  # reset on success
 
         # Extract MILP-recommended values
-        milp_bus_caps_kwh = milp_results['bus_battery_kwh']     # {line_id: kWh}
-        milp_map_cap_kwh = milp_results['map_battery_kwh']      # kWh
+        milp_bus_caps_kwh = milp_results['bus_battery_kwh']  # {line_id: kWh}
+        milp_map_cap_kwh = milp_results['map_battery_kwh']  # kWh
         milp_num_maps = milp_results['num_maps']
+
+        # --- Relax bus capacity cuts when MAP fleet grows ---
+        if milp_num_maps > prev_num_maps:
+            feedback_constraints = relax_bus_capacity_cuts(
+                feedback_constraints, milp_num_maps, prev_num_maps)
+        prev_num_maps = milp_num_maps
 
         # Round MAP battery to nearest step of 10 (it should already be,
         # but ensure integer arithmetic).
@@ -295,7 +616,7 @@ def run_milp_simulation_loop(sim, bus_trips, bus_lines, trip_change_stops,
         )
 
         print(f"\n  Simulation feasibility: {'FEASIBLE [OK]' if results['feasible'] else 'INFEASIBLE [X]'}")
-        print(f"  Min SOC ratio: {results['min_soc_overall_ratio']*100:.1f}%")
+        print(f"  Min SOC ratio: {results['min_soc_overall_ratio'] * 100:.1f}%")
 
         if results['feasible']:
             current_obj = milp_results.get('objective_value')
@@ -318,13 +639,89 @@ def run_milp_simulation_loop(sim, bus_trips, bus_lines, trip_change_stops,
 
             iteration_log.append({
                 'iteration': iteration,
-                'milp_status': milp_results.get('status'),
+                'milp_status': 'MILP',
                 'sim_feasible': True,
                 'bus_battery_kwh': milp_bus_caps_kwh,
                 'map_battery_kwh': milp_map_cap_kwh,
                 'num_maps': milp_num_maps,
                 'objective': current_obj,
             })
+
+            # --- PLATEAU DETECTION: Check if objective value is stagnating ---
+            if prev_objective is not None and abs(current_obj - prev_objective) < 1.0:
+                consecutive_same_objective += 1
+                print(f"  [PLATEAU] Objective unchanged: {consecutive_same_objective}/{MAX_CONSECUTIVE_SAME_OBJECTIVE}")
+            else:
+                consecutive_same_objective = 0
+            prev_objective = current_obj
+
+            # --- If plateau detected, reset with random initial values ---
+            if consecutive_same_objective >= MAX_CONSECUTIVE_SAME_OBJECTIVE:
+                print(f"\n[!] PLATEAU DETECTED: Objective stagnant for {MAX_CONSECUTIVE_SAME_OBJECTIVE} iterations")
+                print(f"    Current best: ${best_cost:,.0f}")
+                print(f"    Resetting with random initial values to explore different regions...")
+
+                # Generate random initial values
+                random_line_caps_wh, random_capacity_wh, random_num_maps, random_map_cap_wh = \
+                    generate_random_initial_values(
+                        bus_lines,
+                        min_bus_cap_kwh=50, max_bus_cap_kwh=500,
+                        min_maps=2, max_maps=20,
+                        min_map_cap_kwh=90, max_map_cap_kwh=500
+                    )
+
+                print(f"    Random values generated:")
+                for lid, cap in sorted({lid: wh / 1000 for lid, wh in random_line_caps_wh.items()}.items()):
+                    print(f"      Line {lid}: {cap:.0f} kWh")
+                print(f"      Number of MAPs: {random_num_maps}")
+                print(f"      MAP battery: {random_map_cap_wh / 1000:.0f} kWh")
+
+                # Run simulation with random values
+                results, stage2_sim = run_terminal_charging_simulation(
+                    sim=sim,
+                    bus_trips_dict=bus_trips,
+                    bus_lines=bus_lines,
+                    trip_change_stops=trip_change_stops,
+                    battery_capacity_wh=random_capacity_wh,
+                    num_maps=random_num_maps,
+                    optimize_threshold=True,
+                    preemption_threshold=None,
+                    simulation_duration_s=86400,
+                    line_battery_capacities_wh=random_line_caps_wh,
+                    map_battery_capacity_wh=random_map_cap_wh,
+                    skip_plots=True,
+                )
+
+                # Clear diagnostic constraints to give MILP fresh start
+                feedback_constraints = [
+                    fc for fc in feedback_constraints
+                    if fc.get('type') not in ['cost_upper_bound', 'optimality_cut']
+                ]
+
+                # Reset plateau tracking
+                consecutive_same_objective = 0
+                prev_objective = None
+
+                # Run MILP with random initial values
+                try:
+                    milp_results = post_simulation_optimize(
+                        results, stage2_sim, bus_lines,
+                        feedback_constraints=feedback_constraints,
+                    )
+                except Exception as e:
+                    print(f"\n[!] MILP error after plateau reset: {e}")
+                    milp_results = None
+
+                iteration_log.append({
+                    'iteration': iteration,
+                    'milp_status': 'plateau_reset',
+                    'sim_feasible': results['feasible'],
+                    'bus_battery_kwh': {lid: wh / 1000 for lid, wh in random_line_caps_wh.items()},
+                    'map_battery_kwh': random_map_cap_wh / 1000,
+                    'num_maps': random_num_maps,
+                    'objective': None,
+                })
+                continue
 
             # Add cost upper-bound to search for a cheaper feasible solution.
             # Use the best known cost minus a small tolerance (1$) so the MILP
@@ -342,6 +739,22 @@ def run_milp_simulation_loop(sim, bus_trips, bus_lines, trip_change_stops,
                            f"${best_cost:,.0f}."),
             })
 
+            # --- Generate optimality cuts ---
+            # These capture the bus-capacity / MAP-fleet tradeoff so the
+            # MILP can explore smaller batteries with more MAPs (or vice
+            # versa) instead of only increasing batteries.
+            opt_cuts = generate_optimality_cuts(results, stage2_sim,
+                                                milp_results)
+            # Replace previous optimality cuts with the latest ones
+            # (they are always re-derived from the most recent simulation).
+            feedback_constraints = [
+                fc for fc in feedback_constraints
+                if fc.get('type') != 'optimality_cut'
+            ]
+            for oc in opt_cuts:
+                print(f"  OPT CUT: {oc['reason']}")
+                feedback_constraints.append(oc)
+
             # Re-run MILP with tighter cost bound
             try:
                 milp_results = post_simulation_optimize(
@@ -352,6 +765,15 @@ def run_milp_simulation_loop(sim, bus_trips, bus_lines, trip_change_stops,
                 print(f"\n[!] MILP error during cost-bound search: {e}")
                 milp_results = None
 
+            iteration_log.append({
+                'iteration': iteration,
+                'milp_status': 'cost_bound_search',
+                'sim_feasible': True,
+                'bus_battery_kwh': milp_bus_caps_kwh,
+                'map_battery_kwh': milp_map_cap_kwh,
+                'num_maps': milp_num_maps,
+                'objective': None,
+            })
             # Do NOT break here - let the loop continue so the MILP has
             # a chance to find cheaper solutions with different constraints.
             continue
@@ -378,7 +800,7 @@ def run_milp_simulation_loop(sim, bus_trips, bus_lines, trip_change_stops,
 
         iteration_log.append({
             'iteration': iteration,
-            'milp_status': milp_results.get('status') if milp_results else None,
+            'milp_status': 'MILP',
             'sim_feasible': False,
             'bus_battery_kwh': milp_results.get('bus_battery_kwh') if milp_results else None,
             'map_battery_kwh': milp_results.get('map_battery_kwh') if milp_results else None,
@@ -404,9 +826,17 @@ def run_milp_simulation_loop(sim, bus_trips, bus_lines, trip_change_stops,
         maps = str(entry.get('num_maps', '-')) if entry.get('num_maps') is not None else '-'
         map_kwh = f"{entry['map_battery_kwh']:.0f}" if entry.get('map_battery_kwh') is not None else '-'
         best_mark = " <-- BEST" if (best_feasible
-                                   and entry.get('sim_feasible')
-                                   and entry.get('iteration') == best_feasible['iteration']) else ""
-        print(f"{entry['iteration']:<6} {entry.get('milp_status',''):<12} {feas:<10} {obj:>15} {maps:>6} {map_kwh:>9}{best_mark}")
+                                    and entry.get('sim_feasible')
+                                    and entry.get('iteration') == best_feasible['iteration']) else ""
+        print(
+            f"{entry['iteration']:<6} {entry.get('milp_status', ''):<12} {feas:<10} {obj:>15} {maps:>6} {map_kwh:>9}{best_mark}")
+
+        # Print bus battery capacities for this iteration
+        bus_caps = entry.get('bus_battery_kwh')
+        if bus_caps:
+            caps_str = ", ".join([f"Line {lid}: {cap:.0f} kWh"
+                                  for lid, cap in sorted(bus_caps.items())])
+            print(f"  Bus_batt: {caps_str}")
     print()
 
     # --- Generate plots only for the best feasible (optimal) iteration ---
@@ -433,15 +863,15 @@ def main():
     simulation_only = "--sim-only" in sys.argv
 
     if simulation_only:
-        print("\n" + "="*70)
+        print("\n" + "=" * 70)
         print("STAGE-2: SIMULATION-ONLY MODE (no MILP loop)")
         print("  Use this to validate parameters proposed by the MILP.")
-        print("="*70)
+        print("=" * 70)
     else:
-        print("\n" + "="*70)
+        print("\n" + "=" * 70)
         print("STAGE-2: TERMINAL CHARGING WITH INTEGRATED OPTIMIZED PREEMPTION")
         print("  + MILP <-> SIMULATION FEEDBACK LOOP")
-        print("="*70)
+        print("=" * 70)
 
     try:
         sim, bus_lines = load_stockholm_data()
@@ -467,11 +897,11 @@ def main():
 
     # Per-line battery capacities (kWh)
     LINE_BATTERY_CAPACITIES_KWH = {
-        "1": 270,
-        "2": 130,
-        "3": 280,
-        "4": 200,
-        "6": 50,
+        "1": 500,
+        "2": 500,
+        "3": 500,
+        "4": 500,
+        "6": 500,
     }
     # Convert to Wh for the simulation
     line_battery_capacities_wh = {
@@ -480,13 +910,13 @@ def main():
 
     # Default fallback capacity and initial MAP count
     initial_capacity_wh = 140 * 1000
-    initial_num_maps = 2
+    initial_num_maps = 20
 
     if simulation_only:
         # ---- Simulation-only mode ----
-        print("\n" + "="*70)
+        print("\n" + "=" * 70)
         print("RUNNING SINGLE SIMULATION (no MILP)")
-        print("="*70)
+        print("=" * 70)
 
         results, stage2_sim = run_terminal_charging_simulation(
             sim=sim,
@@ -503,19 +933,19 @@ def main():
         )
 
         # Final summary
-        print("\n" + "="*70)
+        print("\n" + "=" * 70)
         print("SIMULATION-ONLY RESULTS")
-        print("="*70)
+        print("=" * 70)
         print(f"\nSimulation feasible: {'YES' if results['feasible'] else 'NO'}")
-        print(f"Min SOC: {results['min_soc_overall_ratio']*100:.1f}%")
-        print(f"Total energy charged: {results['total_energy_charged_wh']/1e6:,.3f} MWh")
-        print(f"\n{'='*70}\n")
+        print(f"Min SOC: {results['min_soc_overall_ratio'] * 100:.1f}%")
+        print(f"Total energy charged: {results['total_energy_charged_wh'] / 1e6:,.3f} MWh")
+        print(f"\n{'=' * 70}\n")
 
     else:
         # ---- MILP feedback loop mode ----
-        print("\n" + "="*70)
+        print("\n" + "=" * 70)
         print("MILP <-> SIMULATION FEEDBACK LOOP")
-        print("="*70)
+        print("=" * 70)
 
         milp_results, sim_results, stage2_sim, log = run_milp_simulation_loop(
             sim=sim,
@@ -529,9 +959,9 @@ def main():
         )
 
         # Final summary
-        print("\n" + "="*70)
+        print("\n" + "=" * 70)
         print("FINAL RESULTS")
-        print("="*70)
+        print("=" * 70)
 
         if milp_results and milp_results.get('objective_value') is not None:
             print(f"\nOptimal Cost: ${milp_results['objective_value']:,.2f}")
@@ -541,11 +971,12 @@ def main():
             for lid, cap in sorted(milp_results['bus_battery_kwh'].items()):
                 print(f"  Line {lid}: {cap:.0f} kWh")
             print(f"\nSimulation feasible: {'YES' if sim_results['feasible'] else 'NO'}")
-            print(f"Min SOC: {sim_results['min_soc_overall_ratio']*100:.1f}%")
+            print(f"Min SOC: {sim_results['min_soc_overall_ratio'] * 100:.1f}%")
         else:
             print("\nNo feasible MILP solution found.")
 
-        print(f"\n{'='*70}\n")
+        print(f"\n{'=' * 70}\n")
+
 
 if __name__ == "__main__":
     main()
