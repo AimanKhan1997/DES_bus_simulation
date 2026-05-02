@@ -52,12 +52,15 @@ BUS_MIN_SOC_FRACTION = 0.20               # 20% minimum bus SOC
 MAP_MIN_SOC_FRACTION = 0.10               # 10% minimum MAP SOC
 OVERNIGHT_CHARGING_HOURS = 4.0            # hours available for overnight charging
 
-# Two-phase feasibility-restoration parameters
-# Phase A minimises a weighted sum of SOC slack variables; weights are
-# derived from the simulation's observed SOC deficits so that buses /
-# MAPs that are furthest below their minimum SOC threshold receive the
-# highest marginal cost per Wh of remaining slack.
-FEASIBILITY_EPSILON_WH = 1.0   # Wh – treat Phase A solution as "zero-violation"
+# Two-phase optimisation strategy:
+# Phase B (primary):  minimise total system cost subject to zero SOC violations.
+#                     This is the preferred outcome – a cheapest feasible solution.
+# Phase A (fallback): entered only when Phase B is infeasible.  Minimises a
+#                     weighted sum of per-line (and per-bus / MAP) SOC deficit
+#                     slack variables so that the solver reports how close the
+#                     best infeasible solution comes to satisfying all constraints
+#                     and suggests sizing that minimises the remaining shortfall.
+FEASIBILITY_EPSILON_WH = 1.0   # Wh – treat Phase B slack as "zero-violation"
                                 #       when total slack ≤ this threshold
 PHASE_A_BASELINE_WEIGHT = 1e-4  # dimensionless weight for buses that are
                                  # *not* currently violating the SOC threshold.
@@ -672,13 +675,125 @@ def run_milp_optimization(sim_data,
                    + phase_a_weight_map * s_map
                    + gp.quicksum(phase_a_weights_line[l] * s_line[l] for l in line_ids))
 
+    # ---------------------------------------------------------------
+    # Phase B – minimise cost subject to zero violations (primary phase)
+    #
+    # Pin all slack variables to (near-)zero so the solver must find a
+    # fully feasible solution before minimising cost.
+    # ---------------------------------------------------------------
+    print("\n  [Phase B] Enforcing feasibility and minimising total cost ...")
+
+    for b in bus_ids:
+        model.addConstr(s_bus[b] <= FEASIBILITY_EPSILON_WH,
+                        name=f"phase_b_viol_bus_{b}")
+    model.addConstr(s_map <= FEASIBILITY_EPSILON_WH,
+                    name="phase_b_viol_map")
+    for l in line_ids:
+        model.addConstr(s_line[l] <= FEASIBILITY_EPSILON_WH,
+                        name=f"phase_b_viol_line_{l}")
+
+    # Apply cost upper-bound (if any) from the feedback loop.
+    if feedback_constraints:
+        for i, fc in enumerate(feedback_constraints):
+            if fc.get('type') == 'cost_upper_bound':
+                model.addConstr(total_cost_expr <= fc['value'],
+                                name=f"fb_cost_ub_{i}")
+
+    model.setObjective(total_cost_expr, GRB.MINIMIZE)
+    model.optimize()
+
+    # ---------------------------------------------------------------
+    # Evaluate Phase B result
+    # ---------------------------------------------------------------
+    if model.status in (GRB.OPTIMAL, GRB.SUBOPTIMAL):
+        # Phase B found a feasible, cost-optimal solution.
+        current_phase = 'B'
+        phase_b_status = ('optimal' if model.status == GRB.OPTIMAL
+                          else 'suboptimal')
+
+        bus_bat = {l: B[l].X for l in line_ids}
+        n_map_val = int(round(N_map.X))
+        b_map_val = B_map.X
+        e_overnight_val = E_overnight.X
+
+        cost_bus_bat = sum(
+            BATTERY_COST_PER_KWH * B[l].X * per_line[l]['num_buses']
+            for l in line_ids)
+        cost_map_bat = BATTERY_COST_PER_KWH * n_map_val * b_map_val
+        cost_map_hw = MAP_HARDWARE_COST * n_map_val
+        cost_overnight = per_bus_charger_cost * num_buses
+        n_bus_violations = sum(int(round(v_bus[b].X)) for b in bus_ids)
+        n_map_violations = int(round(v_map.X))
+        cost_penalty = (BUS_SOC_VIOLATION_PENALTY * n_bus_violations
+                        + MAP_SOC_VIOLATION_PENALTY * n_map_violations)
+        total_violation_final_wh = (
+            sum(s_bus[b].X for b in bus_ids)
+            + s_map.X
+            + sum(s_line[l].X for l in line_ids)
+        )
+
+        print(f"  [Phase B] Feasible solution found  "
+              f"cost=${model.objVal:,.2f}  status={phase_b_status}")
+
+        return {
+            'status': phase_b_status,
+            'objective_value': model.objVal,
+            'bus_battery_kwh': bus_bat,
+            'map_battery_kwh': b_map_val,
+            'num_maps': n_map_val,
+            'overnight_energy_kwh': e_overnight_val / 1000.0,
+            'charger_power_kw': charger_power_kw,
+            'charger_cost_per_kw': charger_cost_per_kw,
+            'per_bus_charger_cost': per_bus_charger_cost,
+            'phase': 'B',
+            'phase_a_violation_wh': 0.0,
+            'total_violation_wh': total_violation_final_wh,
+            'total_cost_breakdown': {
+                'bus_battery_cost': cost_bus_bat,
+                'map_battery_cost': cost_map_bat,
+                'map_hardware_cost': cost_map_hw,
+                'overnight_cost': cost_overnight,
+                'penalty_cost': cost_penalty,
+                'bus_soc_violations': n_bus_violations,
+                'map_soc_violations': n_map_violations,
+            },
+        }
+
+    # ---------------------------------------------------------------
+    # Phase B infeasible – fall back to Phase A
+    #
+    # Remove Phase B pin constraints so the slack variables are free,
+    # then minimise the weighted deficit per line (and per bus / MAP).
+    # ---------------------------------------------------------------
+    print(f"  [Phase B] No feasible solution found – "
+          f"falling back to Phase A (minimise deficit per line) ...")
+
+    for b in bus_ids:
+        c = model.getConstrByName(f"phase_b_viol_bus_{b}")
+        if c is not None:
+            model.remove(c)
+    c = model.getConstrByName("phase_b_viol_map")
+    if c is not None:
+        model.remove(c)
+    for l in line_ids:
+        c = model.getConstrByName(f"phase_b_viol_line_{l}")
+        if c is not None:
+            model.remove(c)
+    if feedback_constraints:
+        for i, fc in enumerate(feedback_constraints):
+            if fc.get('type') == 'cost_upper_bound':
+                c = model.getConstrByName(f"fb_cost_ub_{i}")
+                if c is not None:
+                    model.remove(c)
+
+    # ---------------------------------------------------------------
+    # Phase A – minimise weighted sum of per-line (and per-bus / MAP)
+    #           SOC deficits
+    # ---------------------------------------------------------------
     print("\n  [Phase A] Minimizing simulation-derived SOC violation weights ...")
     model.setObjective(phase_a_obj, GRB.MINIMIZE)
     model.optimize()
 
-    # ---------------------------------------------------------------
-    # Evaluate Phase A result
-    # ---------------------------------------------------------------
     if model.status not in (GRB.OPTIMAL, GRB.SUBOPTIMAL):
         return {
             'status': ('infeasible' if model.status == GRB.INFEASIBLE
@@ -694,120 +809,40 @@ def run_milp_optimization(sim_data,
         + s_map.X
         + sum(s_line[l].X for l in line_ids)
     )
-    print(f"  [Phase A] Total SOC violation: {phase_a_violation_wh:.2f} Wh")
-
-    # ---------------------------------------------------------------
-    # Phase B – minimise cost subject to (near-)zero violations
-    #
-    # Only entered when Phase A drives all slack variables to within
-    # FEASIBILITY_EPSILON_WH of zero, meaning the solver believes the
-    # recommended sizing will satisfy all SOC constraints.
-    # ---------------------------------------------------------------
-    current_phase = 'A'
-    phase_b_status = None
-
-    if phase_a_violation_wh <= FEASIBILITY_EPSILON_WH:
-        print(f"  [Phase B] Violations ≤ {FEASIBILITY_EPSILON_WH} Wh – "
-              f"enforcing feasibility and minimising cost ...")
-
-        # Pin all slack variables to (near-)zero so Phase B cannot
-        # reintroduce violations to reduce cost.
-        for b in bus_ids:
-            model.addConstr(s_bus[b] <= FEASIBILITY_EPSILON_WH,
-                            name=f"phase_b_viol_bus_{b}")
-        model.addConstr(s_map <= FEASIBILITY_EPSILON_WH,
-                        name="phase_b_viol_map")
-        for l in line_ids:
-            model.addConstr(s_line[l] <= FEASIBILITY_EPSILON_WH,
-                            name=f"phase_b_viol_line_{l}")
-
-        # Apply cost upper-bound (if any) from the feedback loop so that
-        # Phase B searches for solutions cheaper than the current best.
-        if feedback_constraints:
-            for i, fc in enumerate(feedback_constraints):
-                if fc.get('type') == 'cost_upper_bound':
-                    model.addConstr(total_cost_expr <= fc['value'],
-                                    name=f"fb_cost_ub_{i}")
-
-        model.setObjective(total_cost_expr, GRB.MINIMIZE)
-        model.optimize()
-
-        if model.status in (GRB.OPTIMAL, GRB.SUBOPTIMAL):
-            current_phase = 'B'
-            phase_b_status = ('optimal' if model.status == GRB.OPTIMAL
-                              else 'suboptimal')
-        else:
-            # Phase B infeasible (e.g. cost upper-bound too tight);
-            # fall back to the Phase A solution.
-            print(f"  [Phase B] Infeasible (cost upper-bound may be too tight); "
-                  f"returning Phase A sizing.")
-            # Restore Phase A solution by re-solving without cost bound
-            for b in bus_ids:
-                model.remove(model.getConstrByName(f"phase_b_viol_bus_{b}"))
-            map_constr = model.getConstrByName("phase_b_viol_map")
-            if map_constr is not None:
-                model.remove(map_constr)
-            for l in line_ids:
-                lc = model.getConstrByName(f"phase_b_viol_line_{l}")
-                if lc is not None:
-                    model.remove(lc)
-            if feedback_constraints:
-                for i, fc in enumerate(feedback_constraints):
-                    if fc.get('type') == 'cost_upper_bound':
-                        c = model.getConstrByName(f"fb_cost_ub_{i}")
-                        if c is not None:
-                            model.remove(c)
-            model.setObjective(phase_a_obj, GRB.MINIMIZE)
-            model.optimize()
-            if model.status not in (GRB.OPTIMAL, GRB.SUBOPTIMAL):
-                return {
-                    'status': ('infeasible' if model.status == GRB.INFEASIBLE
-                               else f'gurobi_status_{model.status}'),
-                    'objective_value': None,
-                    'phase': 'A',
-                    'phase_a_violation_wh': phase_a_violation_wh,
-                    'total_violation_wh': phase_a_violation_wh,
-                }
-
-    # ---------------------------------------------------------------
-    # Extract results
-    # ---------------------------------------------------------------
-    if model.status not in (GRB.OPTIMAL, GRB.SUBOPTIMAL):
-        return {
-            'status': ('infeasible' if model.status == GRB.INFEASIBLE
-                       else f'gurobi_status_{model.status}'),
-            'objective_value': None,
-            'phase': current_phase,
-            'phase_a_violation_wh': phase_a_violation_wh,
-            'total_violation_wh': phase_a_violation_wh,
-        }
 
     bus_bat = {l: B[l].X for l in line_ids}
     n_map_val = int(round(N_map.X))
     b_map_val = B_map.X
     e_overnight_val = E_overnight.X
+    per_line_deficit_wh = {l: s_line[l].X for l in line_ids}
+    per_bus_slack_wh = {b: s_bus[b].X for b in bus_ids}
+    map_slack_wh = s_map.X
 
+    print(f"\n  [Phase A] Total SOC violation: {phase_a_violation_wh:.2f} Wh")
+    print(f"\n  [Phase A] Suggested sizing values:")
+    print(f"    MAP battery capacity: {b_map_val:.1f} kWh")
+    print(f"    Number of MAPs:       {n_map_val}")
+    for l in sorted(line_ids):
+        deficit = per_line_deficit_wh[l]
+        print(f"    Line {l}: bus battery = {bus_bat[l]:.1f} kWh  "
+              f"(remaining deficit = {deficit / 1000:.3f} kWh)")
+    if map_slack_wh > FEASIBILITY_EPSILON_WH:
+        print(f"    MAP remaining deficit: {map_slack_wh / 1000:.3f} kWh")
+
+    n_bus_violations = sum(int(round(v_bus[b].X)) for b in bus_ids)
+    n_map_violations = int(round(v_map.X))
     cost_bus_bat = sum(
-        BATTERY_COST_PER_KWH * B[l].X * per_line[l]['num_buses']
+        BATTERY_COST_PER_KWH * bus_bat[l] * per_line[l]['num_buses']
         for l in line_ids)
     cost_map_bat = BATTERY_COST_PER_KWH * n_map_val * b_map_val
     cost_map_hw = MAP_HARDWARE_COST * n_map_val
     cost_overnight = per_bus_charger_cost * num_buses
-    n_bus_violations = sum(int(round(v_bus[b].X)) for b in bus_ids)
-    n_map_violations = int(round(v_map.X))
     cost_penalty = (BUS_SOC_VIOLATION_PENALTY * n_bus_violations
                     + MAP_SOC_VIOLATION_PENALTY * n_map_violations)
+    final_status = 'optimal' if model.status == GRB.OPTIMAL else 'suboptimal'
 
-    # Report which phase produced the final solution
-    final_status = phase_b_status if current_phase == 'B' else (
-        'optimal' if model.status == GRB.OPTIMAL else 'suboptimal')
-    total_violation_final_wh = (
-        sum(s_bus[b].X for b in bus_ids)
-        + s_map.X
-        + sum(s_line[l].X for l in line_ids)
-    )
-    print(f"  [Phase {current_phase}] Final solution  "
-          f"violation={total_violation_final_wh:.2f} Wh  "
+    print(f"  [Phase A] Final solution  "
+          f"violation={phase_a_violation_wh:.2f} Wh  "
           f"status={final_status}")
 
     return {
@@ -820,9 +855,12 @@ def run_milp_optimization(sim_data,
         'charger_power_kw': charger_power_kw,
         'charger_cost_per_kw': charger_cost_per_kw,
         'per_bus_charger_cost': per_bus_charger_cost,
-        'phase': current_phase,
+        'phase': 'A',
         'phase_a_violation_wh': phase_a_violation_wh,
-        'total_violation_wh': total_violation_final_wh,
+        'total_violation_wh': phase_a_violation_wh,
+        'phase_a_per_line_deficit_wh': per_line_deficit_wh,
+        'phase_a_per_bus_slack_wh': per_bus_slack_wh,
+        'phase_a_map_slack_wh': map_slack_wh,
         'total_cost_breakdown': {
             'bus_battery_cost': cost_bus_bat,
             'map_battery_cost': cost_map_bat,
@@ -938,37 +976,55 @@ def post_simulation_optimize(results, stage2_sim, bus_lines,
 
     if opt_results['objective_value'] is not None:
         phase_label = opt_results.get('phase', '?')
-        phase_a_viol = opt_results.get('phase_a_violation_wh')
         total_viol = opt_results.get('total_violation_wh', 0.0)
         print(f"\nStatus:          {opt_results['status']}")
-        viol_str = f"{phase_a_viol:.2f} Wh" if phase_a_viol is not None else "N/A"
-        print(f"Optimizer phase: {phase_label}  (Phase A violation: {viol_str})")
+        print(f"Optimizer phase: {phase_label}")
+
         if phase_label == 'A':
-            print(f"  *** Feasibility not yet achieved – "
-                  f"Phase A found {total_viol:.2f} Wh of remaining SOC violation. ***")
-            print(f"  Re-simulating with recommended sizing to update violation weights.")
+            # Phase B was infeasible; report Phase A suggested values.
+            print(f"\n  *** No feasible solution found (Phase B infeasible). ***")
+            print(f"  Phase A minimised the per-line deficit "
+                  f"(total remaining violation: {total_viol:.2f} Wh).")
+            print(f"\n  Phase A Suggested Sizing:")
+            print(f"    MAP battery capacity: {opt_results['map_battery_kwh']:.1f} kWh")
+            print(f"    Number of MAPs:       {opt_results['num_maps']}")
+            per_line_deficit = opt_results.get('phase_a_per_line_deficit_wh', {})
+            print(f"\n    Per-Line Bus Battery Capacities and Remaining Deficits:")
+            for lid, cap in sorted(opt_results['bus_battery_kwh'].items()):
+                n = sim_data['per_line'][lid]['num_buses']
+                deficit_kwh = per_line_deficit.get(lid, 0.0) / 1000.0
+                deficit_str = (f"  remaining deficit = {deficit_kwh:.3f} kWh"
+                               if deficit_kwh > FEASIBILITY_EPSILON_WH / 1000.0
+                               else "  (deficit covered)")
+                print(f"      Line {lid}: {cap:>7.1f} kWh  × {n} buses"
+                      f"  = {cap * n:>10.1f} kWh total{deficit_str}")
+            map_slack_kwh = opt_results.get('phase_a_map_slack_wh', 0.0) / 1000.0
+            if map_slack_kwh > FEASIBILITY_EPSILON_WH / 1000.0:
+                print(f"    MAP remaining deficit: {map_slack_kwh:.3f} kWh")
+            print(f"\n    Overnight Energy: {opt_results['overnight_energy_kwh']:.1f} kWh")
+            print(f"    Charger Power Level: {opt_results['charger_power_kw']:.1f} kW")
         else:
+            # Phase B succeeded – report cost-optimal solution.
             print(f"Total Objective (Cost): ${opt_results['objective_value']:,.2f}")
 
-        print("\nOptimal Bus Battery Capacities (per line):")
-        for lid, cap in sorted(opt_results['bus_battery_kwh'].items()):
-            n = sim_data['per_line'][lid]['num_buses']
-            print(f"  Line {lid}: {cap:>7.1f} kWh  × {n} buses  "
-                  f"= {cap * n:>10.1f} kWh total")
+            print("\nOptimal Bus Battery Capacities (per line):")
+            for lid, cap in sorted(opt_results['bus_battery_kwh'].items()):
+                n = sim_data['per_line'][lid]['num_buses']
+                print(f"  Line {lid}: {cap:>7.1f} kWh  × {n} buses  "
+                      f"= {cap * n:>10.1f} kWh total")
 
-        print(f"\nOptimal MAP Battery Capacity: "
-              f"{opt_results['map_battery_kwh']:.1f} kWh")
-        print(f"Optimal Number of MAPs:      {opt_results['num_maps']}")
-        print(f"Overnight Energy:            "
-              f"{opt_results['overnight_energy_kwh']:.1f} kWh")
-        print(f"Charger Power Level:         "
-              f"{opt_results['charger_power_kw']:.1f} kW")
-        print(f"Charger Cost Tier:           "
-              f"${opt_results['charger_cost_per_kw']:.0f}/kW")
-        print(f"Per-Bus Charger Cost:        "
-              f"${opt_results['per_bus_charger_cost']:,.2f}")
+            print(f"\nOptimal MAP Battery Capacity: "
+                  f"{opt_results['map_battery_kwh']:.1f} kWh")
+            print(f"Optimal Number of MAPs:      {opt_results['num_maps']}")
+            print(f"Overnight Energy:            "
+                  f"{opt_results['overnight_energy_kwh']:.1f} kWh")
+            print(f"Charger Power Level:         "
+                  f"{opt_results['charger_power_kw']:.1f} kW")
+            print(f"Charger Cost Tier:           "
+                  f"${opt_results['charger_cost_per_kw']:.0f}/kW")
+            print(f"Per-Bus Charger Cost:        "
+                  f"${opt_results['per_bus_charger_cost']:,.2f}")
 
-        if phase_label == 'B':
             cb = opt_results['total_cost_breakdown']
             num_b = sim_data['system']['num_buses']
             print("\nCost Breakdown:")
