@@ -155,6 +155,7 @@ def extract_simulation_data(results, stage2_sim, bus_lines):
     per_map = {}
     sim_map_battery_wh = actual_map_cap_wh
     total_map_self_charge_wh = 0.0
+    total_map_movement_energy_wh = 0.0
 
     if sim_num_maps > 0:
         for map_id in range(sim_num_maps):
@@ -171,10 +172,15 @@ def extract_simulation_data(results, stage2_sim, bus_lines):
                     map_self_charge += delta
             total_map_self_charge_wh += map_self_charge
 
+            # Get movement energy for this MAP
+            map_movement_energy = stage2_sim.map_tracker.map_movement_energy_wh.get(map_id, 0.0)
+            total_map_movement_energy_wh += map_movement_energy
+
             per_map[map_id] = {
                 'total_energy_delivered_wh': total_delivered,
                 'min_soc_wh': min_soc,
                 'self_charge_energy_wh': map_self_charge,
+                'movement_energy_wh': map_movement_energy,
             }
 
     # --- system totals ---
@@ -192,6 +198,7 @@ def extract_simulation_data(results, stage2_sim, bus_lines):
             'total_energy_consumed_wh': total_energy_consumed,
             'total_energy_charged_wh': total_energy_charged,
             'total_map_self_charge_wh': total_map_self_charge_wh,
+            'total_map_movement_energy_wh': total_map_movement_energy_wh,
             'num_buses': results['num_buses'],
         },
     }
@@ -202,7 +209,7 @@ def extract_simulation_data(results, stage2_sim, bus_lines):
 # ========================
 
 def run_milp_optimization(sim_data,
-                          max_maps=10,
+                          max_maps=20,
                           bus_cap_min_kwh=50.0,
                           bus_cap_max_kwh=500.0,
                           map_cap_min_kwh=50.0,
@@ -324,7 +331,7 @@ def run_milp_optimization(sim_data,
     v_map = model.addVar(vtype=GRB.BINARY, name="v_map")
 
     # Overnight energy (Wh)
-    E_overnight = model.addVar(lb=0.0, vtype=GRB.CONTINUOUS,
+    E_overnight = model.addVar(lb=0.0, ub=total_energy_consumed, vtype=GRB.CONTINUOUS,
                                name="E_overnight")
 
     # Total energy charged by MAPs under new sizing (Wh)
@@ -367,18 +374,40 @@ def run_milp_optimization(sim_data,
 
     # 1. Bus SOC ≥ 20%  (per bus, with penalty slack)
     #    deficit(b) = sim_capacity_for_line − min_soc_wh(b)
-    #    new_min_soc(b) = B_l·1000 − deficit(b)
+    #    new_min_soc(b) = B_l·1000 − deficit(b) + map_charging_credit
     #    require: new_min_soc(b) ≥ 0.20 · B_l·1000  ⟹
-    #      (1−0.20)·B_l·1000 ≥ deficit(b) − s_bus(b)
+    #      (1−0.20)·B_l·1000 ≥ deficit(b) − map_credit − s_bus(b)
+    #
+    # The MAP charging credit makes the deficit a function of MAP capacity
+    # rather than frozen from one simulation.  For each bus, the credit is
+    # proportional to how the total MAP capacity (W) changes relative to
+    # the simulation baseline.
+    sim_total_map_cap_wh = sim_num_maps * sim_map_battery_wh
+
     for bus_id in bus_ids:
         bdata = per_bus[bus_id]
         lid = bdata['line_id']
         bus_sim_cap = bdata['sim_battery_wh']
         deficit = bus_sim_cap - bdata['min_soc_wh']
 
+        # Per-bus MAP charging credit rate:
+        #   How much energy this bus received from MAPs per Wh of total MAP
+        #   capacity.  As MAP capacity grows, the bus receives proportionally
+        #   more charging, reducing its effective deficit.
+        per_bus_charged = bdata.get('energy_charged_wh', 0.0)
+        if sim_total_map_cap_wh > 0:
+            charging_rate = per_bus_charged / sim_total_map_cap_wh
+        else:
+            charging_rate = 0.0
+
+        # map_credit = charging_rate × (W×1000 − baseline)
+        #   positive when MAP capacity increases → deficit shrinks
+        #   negative when MAP capacity decreases → deficit grows
+        map_credit = charging_rate * (W * 1000 - sim_total_map_cap_wh)
+
         model.addConstr(
             (1.0 - BUS_MIN_SOC_FRACTION) * B[lid] * 1000
-            - deficit + s_bus[bus_id] >= 0,
+            - deficit + map_credit + s_bus[bus_id] >= 0,
             name=f"bus_soc_{bus_id}")
 
         # link slack → violation indicator
@@ -436,6 +465,16 @@ def run_milp_optimization(sim_data,
             elif fc_type == 'min_maps':
                 model.addConstr(N_map >= fc_val,
                                 name=f"fb_min_maps_{i}")
+            elif fc_type == 'optimality_cut':
+                # Tradeoff cut:  B_l + γ · N_map ≥ threshold
+                # Allows the MILP to trade smaller batteries for more MAPs.
+                lid = fc.get('line_id', '')
+                gamma = fc.get('gamma', 0.0)
+                threshold = fc.get('threshold', 0.0)
+                if lid in B and gamma > 0:
+                    model.addConstr(
+                        B[lid] + gamma * N_map >= threshold,
+                        name=f"fb_opt_cut_{lid}_{i}")
 
     # ---------------------------------------------------------------
     # Objective
@@ -469,16 +508,13 @@ def run_milp_optimization(sim_data,
         BATTERY_COST_PER_KWH * B[l] * per_line[l]['num_buses']
         for l in line_ids
     )
-    map_battery_cost = BATTERY_COST_PER_KWH * W
+    map_battery_cost = BATTERY_COST_PER_KWH * N_map * B_map
     map_hardware_cost = MAP_HARDWARE_COST * N_map
-    # Overnight cost is a linear function of E_overnight so that the MILP
-    # can see the benefit of adding MAPs (which increase E_charged_scaled
-    # and thus reduce E_overnight).
-    # Total overnight cost = cost_per_kw × E_overnight_kwh / 4
-    #   = charger_cost_per_kw × (E_overnight / 1000) / OVERNIGHT_CHARGING_HOURS
-    overnight_cost_expr = (charger_cost_per_kw
-                           * E_overnight / 1000.0
-                           / OVERNIGHT_CHARGING_HOURS)
+    # Use fixed overnight cost based on simulation's charger power tier
+    # The E_overnight variable is still constrained in the SOC constraint,
+    # but the cost is fixed to the simulation-based per-bus charger cost
+    # to ensure consistency between objective and cost breakdown
+    overnight_cost_expr = per_bus_charger_cost * num_buses
     bus_penalty = BUS_SOC_VIOLATION_PENALTY * gp.quicksum(
         v_bus[b] for b in bus_ids)
     map_penalty = MAP_SOC_VIOLATION_PENALTY * v_map
@@ -516,11 +552,9 @@ def run_milp_optimization(sim_data,
         cost_bus_bat = sum(
             BATTERY_COST_PER_KWH * B[l].X * per_line[l]['num_buses']
             for l in line_ids)
-        cost_map_bat = BATTERY_COST_PER_KWH * W.X
+        cost_map_bat = BATTERY_COST_PER_KWH * n_map_val * b_map_val
         cost_map_hw = MAP_HARDWARE_COST * n_map_val
-        cost_overnight = (charger_cost_per_kw
-                         * (e_overnight_val / 1000.0)
-                         / OVERNIGHT_CHARGING_HOURS)
+        cost_overnight = per_bus_charger_cost * num_buses
         n_bus_violations = sum(int(round(v_bus[b].X)) for b in bus_ids)
         n_map_violations = int(round(v_map.X))
         cost_penalty = (BUS_SOC_VIOLATION_PENALTY * n_bus_violations
@@ -560,7 +594,7 @@ def run_milp_optimization(sim_data,
 # ========================
 
 def post_simulation_optimize(results, stage2_sim, bus_lines,
-                             max_maps=10,
+                             max_maps=20,
                              bus_cap_min_kwh=50.0,
                              bus_cap_max_kwh=500.0,
                              map_cap_min_kwh=50.0,
@@ -619,6 +653,8 @@ def post_simulation_optimize(results, stage2_sim, bus_lines,
           f"{sim_data['system']['total_energy_charged_wh'] / 1e6:.3f} MWh")
     print(f"  MAP self-charge energy: "
           f"{sim_data['system']['total_map_self_charge_wh'] / 1e6:.3f} MWh")
+    print(f"  MAP movement energy:    "
+          f"{sim_data['system']['total_map_movement_energy_wh'] / 1e6:.3f} MWh")
     print(f"  Number of buses:        "
           f"{sim_data['system']['num_buses']}")
 
@@ -635,7 +671,8 @@ def post_simulation_optimize(results, stage2_sim, bus_lines,
             print(f"  MAP {mid}: delivered "
                   f"{mdata['total_energy_delivered_wh'] / 1000:.1f} kWh, "
                   f"min SOC {mdata['min_soc_wh'] / 1000:.1f} kWh, "
-                  f"self-charge {mdata['self_charge_energy_wh'] / 1000:.1f} kWh")
+                  f"self-charge {mdata['self_charge_energy_wh'] / 1000:.1f} kWh, "
+                  f"movement {mdata['movement_energy_wh'] / 1000:.1f} kWh")
 
     # --- solve ---
     opt_results = run_milp_optimization(
