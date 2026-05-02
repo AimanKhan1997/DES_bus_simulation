@@ -576,10 +576,10 @@ def run_milp_simulation_loop(sim, bus_trips, bus_lines, trip_change_stops,
         milp_map_cap_kwh = milp_results['map_battery_kwh']  # kWh
         milp_num_maps = milp_results['num_maps']
 
-        # --- Relax bus capacity cuts when MAP fleet grows ---
-        if milp_num_maps > prev_num_maps:
-            feedback_constraints = relax_bus_capacity_cuts(
-                feedback_constraints, milp_num_maps, prev_num_maps)
+        # Track MAP fleet size for reporting purposes.
+        # (Hard bus_min_cap / map_min_cap / min_maps feasibility cuts are no
+        #  longer added to the feedback loop; Phase A drives the solver toward
+        #  feasibility automatically via simulation-derived violation weights.)
         prev_num_maps = milp_num_maps
 
         # Round MAP battery to nearest step of 10 (it should already be,
@@ -617,6 +617,10 @@ def run_milp_simulation_loop(sim, bus_trips, bus_lines, trip_change_stops,
 
         print(f"\n  Simulation feasibility: {'FEASIBLE [OK]' if results['feasible'] else 'INFEASIBLE [X]'}")
         print(f"  Min SOC ratio: {results['min_soc_overall_ratio'] * 100:.1f}%")
+        milp_phase = milp_results.get('phase', '?')
+        phase_a_viol = milp_results.get('phase_a_violation_wh')
+        if phase_a_viol is not None:
+            print(f"  MILP phase: {milp_phase}  |  Phase A violation: {phase_a_viol:.2f} Wh")
 
         if results['feasible']:
             current_obj = milp_results.get('objective_value')
@@ -640,11 +644,13 @@ def run_milp_simulation_loop(sim, bus_trips, bus_lines, trip_change_stops,
             iteration_log.append({
                 'iteration': iteration,
                 'milp_status': 'MILP',
+                'milp_phase': milp_results.get('phase', '?'),
                 'sim_feasible': True,
                 'bus_battery_kwh': milp_bus_caps_kwh,
                 'map_battery_kwh': milp_map_cap_kwh,
                 'num_maps': milp_num_maps,
                 'objective': current_obj,
+                'phase_a_violation_wh': milp_results.get('phase_a_violation_wh'),
             })
 
             # --- PLATEAU DETECTION: Check if objective value is stagnating ---
@@ -778,35 +784,37 @@ def run_milp_simulation_loop(sim, bus_trips, bus_lines, trip_change_stops,
             # a chance to find cheaper solutions with different constraints.
             continue
 
-        # --- Infeasible: diagnose and add constraints ---
-        new_constraints = diagnose_infeasibility(results, results['bus_statistics'])
-        if not new_constraints:
-            print("  Could not diagnose infeasibility - continuing to next iteration.")
-            continue
+        # --- Infeasible simulation: Phase A will refine violation weights ---
+        # Hard feasibility cuts are no longer used.  The two-phase MILP
+        # (Phase A) automatically minimises simulation-derived SOC violations,
+        # so the solver is guided toward feasible sizing without any manual
+        # capacity lower-bounds.  We simply re-simulate with the MILP-
+        # recommended values and let Phase A update its violation weights.
+        milp_phase = milp_results.get('phase', '?')
+        phase_a_viol = milp_results.get('phase_a_violation_wh', float('inf'))
+        print(f"  [MILP phase {milp_phase}] Simulation infeasible; "
+              f"Phase A violation was {phase_a_viol:.2f} Wh.  "
+              f"Re-running MILP with updated simulation data ...")
 
-        for fc in new_constraints:
-            print(f"  FEEDBACK: {fc['reason']}")
-            feedback_constraints.append(fc)
-
-        # Re-run MILP with updated constraints
         try:
             milp_results = post_simulation_optimize(
                 results, stage2_sim, bus_lines,
                 feedback_constraints=feedback_constraints,
             )
         except Exception as e:
-            print(f"\n[!] MILP error with feedback constraints: {e}")
+            print(f"\n[!] MILP error after infeasible simulation: {e}")
             milp_results = None
 
         iteration_log.append({
             'iteration': iteration,
-            'milp_status': 'MILP',
+            'milp_status': 'phase_a_refine',
             'sim_feasible': False,
             'bus_battery_kwh': milp_results.get('bus_battery_kwh') if milp_results else None,
             'map_battery_kwh': milp_results.get('map_battery_kwh') if milp_results else None,
             'num_maps': milp_results.get('num_maps') if milp_results else None,
             'objective': milp_results.get('objective_value') if milp_results else None,
-            'feedback_constraints': [fc['reason'] for fc in new_constraints],
+            'phase_a_violation_wh': (milp_results.get('phase_a_violation_wh')
+                                     if milp_results else None),
         })
 
     else:
@@ -818,18 +826,23 @@ def run_milp_simulation_loop(sim, bus_trips, bus_lines, trip_change_stops,
     print("\n" + "=" * 70)
     print("FEEDBACK LOOP SUMMARY")
     print("=" * 70)
-    print(f"\n{'Iter':<6} {'Status':<12} {'Feasible':<10} {'Objective':>15} {'MAPs':>6} {'MAP kWh':>9}")
-    print("-" * 65)
+    print(f"\n{'Iter':<6} {'Status':<15} {'Feas':<6} {'Phase':<7} "
+          f"{'PhA viol(Wh)':>14} {'Objective':>15} {'MAPs':>6} {'MAP kWh':>9}")
+    print("-" * 84)
     for entry in iteration_log:
         feas = "Y" if entry.get('sim_feasible') else "N"
         obj = f"${entry['objective']:,.0f}" if entry.get('objective') is not None else "N/A"
         maps = str(entry.get('num_maps', '-')) if entry.get('num_maps') is not None else '-'
         map_kwh = f"{entry['map_battery_kwh']:.0f}" if entry.get('map_battery_kwh') is not None else '-'
+        phase_val = entry.get('milp_phase', entry.get('milp_status', '?'))
+        pha_viol = entry.get('phase_a_violation_wh')
+        pha_str = f"{pha_viol:.1f}" if pha_viol is not None else '-'
         best_mark = " <-- BEST" if (best_feasible
                                     and entry.get('sim_feasible')
                                     and entry.get('iteration') == best_feasible['iteration']) else ""
         print(
-            f"{entry['iteration']:<6} {entry.get('milp_status', ''):<12} {feas:<10} {obj:>15} {maps:>6} {map_kwh:>9}{best_mark}")
+            f"{entry['iteration']:<6} {entry.get('milp_status', ''):<15} {feas:<6} "
+            f"{phase_val:<7} {pha_str:>14} {obj:>15} {maps:>6} {map_kwh:>9}{best_mark}")
 
         # Print bus battery capacities for this iteration
         bus_caps = entry.get('bus_battery_kwh')
