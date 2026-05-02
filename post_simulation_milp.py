@@ -228,6 +228,7 @@ def extract_simulation_data(results, stage2_sim, bus_lines):
 # ========================
 
 def run_milp_optimization(sim_data,
+                          min_maps=1,
                           max_maps=20,
                           bus_cap_min_kwh=50.0,
                           bus_cap_max_kwh=500.0,
@@ -241,6 +242,9 @@ def run_milp_optimization(sim_data,
     ----------
     sim_data : dict
         Output of :func:`extract_simulation_data`.
+    min_maps : int
+        Hard lower bound on the number of MAPs the MILP may select.
+        Defaults to 1, preventing the solver from reducing MAPs to zero.
     max_maps : int
         Upper bound on the number of MAPs.
     bus_cap_min_kwh, bus_cap_max_kwh : float
