@@ -9,6 +9,36 @@ Decision Variables:
     B_map : MAP battery capacity (kWh)                        (integer, step 10)
     N_map : Number of MAPs                                    (integer)
 
+Two-Phase Optimisation Strategy
+---------------------------------
+Phase A (deficit minimisation – always runs first):
+    Minimise the total energy deficit (Wh) across all buses and lines.
+    The "deficit" for each bus is the energy by which its battery fell short
+    of the BUS_SOC_TARGET_FRACTION (20.1 %) threshold.  A non-zero Phase A
+    objective means the current bounds cannot fully cover the simulation
+    deficit; the result shows the minimum residual shortfall achievable.
+
+Phase B (cost minimisation – runs when Phase A residual ≤ epsilon):
+    Minimise total system cost subject to all SOC constraints being satisfied
+    at the BUS_SOC_TARGET_FRACTION (20.1 %) / MAP_SOC_TARGET_FRACTION (10.1 %)
+    level.  Cost minimisation naturally drives battery sizes to the smallest
+    values that keep the min SOC at exactly the target (≈ 20.1 % for buses),
+    so the system uses the least resources while remaining feasible.
+
+Violation Reporting
+-------------------
+``phase_a_violation_wh``
+    Simulation-based total energy deficit: how much energy buses were short
+    of the 20 % SOC minimum in the *original simulation*, summed across all
+    buses.  This is a fixed number derived from simulation data – it is
+    non-zero whenever any bus ran below 20 % SOC during the simulation.
+
+``milp_residual_violation_wh``
+    MILP residual deficit after Phase A: the remaining energy shortfall at
+    the optimised battery / MAP sizing.  Zero means Phase A found a fully
+    feasible configuration; non-zero means no combination within the allowed
+    bounds can fully cover the deficit.
+
 Objective: Minimize total system cost
     = bus battery cost  (115 $/kWh × capacity × buses per line)
     + MAP battery cost  (115 $/kWh × capacity × number of MAPs)
@@ -29,13 +59,10 @@ Overnight Charging Cost Tiers (per kW of charger capacity):
     can see the benefit of MAPs reducing overnight energy requirements.
 
 Constraints:
-    - No bus may go below 20% SOC (per-bus slack)
-    - No MAP may go below 10% SOC (aggregate slack)
+    - No bus may go below BUS_SOC_TARGET_FRACTION (≈ 20.1 %) SOC (per-bus slack)
+    - No MAP may go below MAP_SOC_TARGET_FRACTION (≈ 10.1 %) SOC (aggregate slack)
     - Per-line energy balance: the aggregate energy deficit on each line must be
       covered by a combination of bus battery size and MAP fleet capacity.
-      This constraint ties the minimum number of MAPs to the per-line deficit:
-      a larger deficit on line l requires either a larger B_l or a larger
-      N_map × B_map, capturing the interdependency between the three decisions.
     - MAP self-charging energy is accounted for in the overnight energy balance
 """
 
@@ -46,28 +73,26 @@ from collections import defaultdict
 # ========================
 BATTERY_COST_PER_KWH = 115.0              # $/kWh for bus and MAP batteries
 MAP_HARDWARE_COST = 40000.0               # $ per MAP unit
-BUS_SOC_VIOLATION_PENALTY = 1_000_000.0   # penalty per bus that violates 20% SOC
-MAP_SOC_VIOLATION_PENALTY = 1_000_000.0   # penalty per MAP that violates 10% SOC
-BUS_MIN_SOC_FRACTION = 0.20               # 20% minimum bus SOC
-MAP_MIN_SOC_FRACTION = 0.10               # 10% minimum MAP SOC
+BUS_SOC_VIOLATION_PENALTY = 1_000_000.0   # penalty per bus that violates SOC target
+MAP_SOC_VIOLATION_PENALTY = 1_000_000.0   # penalty per MAP that violates SOC target
+BUS_MIN_SOC_FRACTION = 0.20               # 20% hard minimum bus SOC (for reporting)
+MAP_MIN_SOC_FRACTION = 0.10               # 10% hard minimum MAP SOC (for reporting)
+# Target fractions used in MILP constraints – slightly above the hard minimum so
+# the optimised solution has a small safety margin and is not on the knife-edge.
+BUS_SOC_TARGET_FRACTION = 0.201           # ≈ 20.1% target min bus SOC
+MAP_SOC_TARGET_FRACTION = 0.101           # ≈ 10.1% target min MAP SOC
 OVERNIGHT_CHARGING_HOURS = 4.0            # hours available for overnight charging
 
 # Two-phase optimisation strategy:
-# Phase B (primary):  minimise total system cost subject to zero SOC violations.
-#                     This is the preferred outcome – a cheapest feasible solution.
-# Phase A (fallback): entered only when Phase B is infeasible.  Minimises a
-#                     weighted sum of per-line (and per-bus / MAP) SOC deficit
-#                     slack variables so that the solver reports how close the
-#                     best infeasible solution comes to satisfying all constraints
-#                     and suggests sizing that minimises the remaining shortfall.
-FEASIBILITY_EPSILON_WH = 1.0   # Wh – treat Phase B slack as "zero-violation"
-                                #       when total slack ≤ this threshold
-PHASE_A_BASELINE_WEIGHT = 1e-4  # dimensionless weight for buses that are
-                                 # *not* currently violating the SOC threshold.
-                                 # Keeps their slack at zero as the preferred
-                                 # solution while avoiding zero-weight degeneracy
-                                 # (which can leave non-violating slacks at
-                                 # arbitrary positive values).
+# Phase A (primary):  minimise total energy deficit (Wh) across all buses / lines.
+#                     The objective value equals the total residual Wh shortfall
+#                     below BUS_SOC_TARGET_FRACTION after optimal resizing.
+#                     When this reaches zero the sizing is fully feasible.
+# Phase B (secondary): entered only when Phase A residual ≤ FEASIBILITY_EPSILON_WH.
+#                     Minimises total system cost subject to zero SOC violations,
+#                     driving battery sizes to the smallest values that keep min
+#                     SOC at BUS_SOC_TARGET_FRACTION (≈ 20.1 %).
+FEASIBILITY_EPSILON_WH = 1.0   # Wh – treat Phase A residual as "zero" when ≤ this
 
 
 def get_overnight_charger_cost_per_kw(charger_power_kw):
@@ -407,11 +432,15 @@ def run_milp_optimization(sim_data,
     # so 1e7 provides a safe margin without causing numerical issues.
     BIG_M = 1e7
 
-    # 1. Bus SOC ≥ 20%  (per bus, with penalty slack)
+    # 1. Bus SOC ≥ BUS_SOC_TARGET_FRACTION (≈ 20.1%)  (per bus, with penalty slack)
     #    deficit(b) = sim_capacity_for_line − min_soc_wh(b)
     #    new_min_soc(b) = B_l·1000 − deficit(b) + map_charging_credit
-    #    require: new_min_soc(b) ≥ 0.20 · B_l·1000  ⟹
-    #      (1−0.20)·B_l·1000 ≥ deficit(b) − map_credit − s_bus(b)
+    #    require: new_min_soc(b) ≥ BUS_SOC_TARGET_FRACTION · B_l·1000  ⟹
+    #      (1−BUS_SOC_TARGET_FRACTION)·B_l·1000 ≥ deficit(b) − map_credit − s_bus(b)
+    #
+    # Using a target slightly above the hard 20% minimum gives a small safety
+    # margin and ensures cost minimisation in Phase B drives batteries to the
+    # smallest size that achieves ≈ 20.1% min SOC (not exactly 20.0%).
     #
     # The MAP charging credit makes the deficit a function of MAP capacity
     # rather than frozen from one simulation.  For each bus, the credit is
@@ -441,7 +470,7 @@ def run_milp_optimization(sim_data,
         map_credit = charging_rate * (W * 1000 - sim_total_map_cap_wh)
 
         model.addConstr(
-            (1.0 - BUS_MIN_SOC_FRACTION) * B[lid] * 1000
+            (1.0 - BUS_SOC_TARGET_FRACTION) * B[lid] * 1000
             - deficit + map_credit + s_bus[bus_id] >= 0,
             name=f"bus_soc_{bus_id}")
 
@@ -449,11 +478,11 @@ def run_milp_optimization(sim_data,
         model.addConstr(s_bus[bus_id] <= BIG_M * v_bus[bus_id],
                         name=f"bus_viol_{bus_id}")
 
-    # 2. MAP SOC ≥ 10%  (aggregate worst-case, with penalty slack)
+    # 2. MAP SOC ≥ MAP_SOC_TARGET_FRACTION (≈ 10.1%)  (aggregate worst-case, with penalty slack)
     #    new_min_map_soc = B_map·1000 − max_map_deficit
-    #    require: (1−0.10)·B_map·1000 ≥ max_map_deficit − s_map
+    #    require: (1−MAP_SOC_TARGET_FRACTION)·B_map·1000 ≥ max_map_deficit − s_map
     model.addConstr(
-        (1.0 - MAP_MIN_SOC_FRACTION) * B_map * 1000
+        (1.0 - MAP_SOC_TARGET_FRACTION) * B_map * 1000
         - max_map_deficit + s_map >= 0,
         name="map_soc")
     model.addConstr(s_map <= BIG_M * v_map, name="map_viol")
@@ -513,7 +542,7 @@ def run_milp_optimization(sim_data,
         line_map_credit = line_charging_rate * (W * 1000 - sim_total_map_cap_wh)
 
         model.addConstr(
-            (1.0 - BUS_MIN_SOC_FRACTION) * B[l] * n_buses_l * 1000
+            (1.0 - BUS_SOC_TARGET_FRACTION) * B[l] * n_buses_l * 1000
             - total_line_deficit_wh
             + line_map_credit
             + s_line[l] >= 0,
@@ -615,76 +644,147 @@ def run_milp_optimization(sim_data,
                        + map_penalty)
 
     # ---------------------------------------------------------------
-    # Phase A – minimise weighted sum of SOC violations
+    # Simulation-based SOC violation metrics  (fixed scalars, not MILP vars)
     #
-    # Weights are derived from the simulation's observed SOC deficits:
-    #   w_b = max(deficit_fraction_b, PHASE_A_BASELINE_WEIGHT)
-    # where deficit_fraction_b = (min_soc_threshold_wh − min_soc_wh_b)
-    #                            / sim_battery_wh_b   (clamped to ≥ 0)
+    # per_line_sim_violation_wh[l] = total energy (Wh) by which buses on
+    #   line l fell BELOW the 20% SOC hard minimum in the simulation.
+    #   This is the "true" deficit that the user sees as buses running out
+    #   of charge – it is non-zero regardless of what the MILP chooses for
+    #   battery sizes.
     #
-    # Buses / MAPs that are furthest below the minimum-SOC threshold
-    # carry the highest per-Wh weight, so the solver is steered toward
-    # closing the largest deficits first.  Buses that are already
-    # compliant receive PHASE_A_BASELINE_WEIGHT so their slack is still
-    # driven to zero rather than left at an arbitrary positive value.
+    # total_sim_violation_wh = sum across all lines + MAP worst-case
     # ---------------------------------------------------------------
-    phase_a_weights_bus = {}
-    for bus_id in bus_ids:
-        bdata = per_bus[bus_id]
-        bus_sim_cap = max(1.0, bdata['sim_battery_wh'])
-        min_soc_threshold_wh = BUS_MIN_SOC_FRACTION * bus_sim_cap
-        actual_min_soc_wh = bdata['min_soc_wh']
-        if actual_min_soc_wh < min_soc_threshold_wh:
-            deficit_frac = (min_soc_threshold_wh - actual_min_soc_wh) / bus_sim_cap
-            phase_a_weights_bus[bus_id] = max(deficit_frac, PHASE_A_BASELINE_WEIGHT)
-        else:
-            phase_a_weights_bus[bus_id] = PHASE_A_BASELINE_WEIGHT
+    per_line_sim_violation_wh = {}
+    for l in line_ids:
+        lb = [b for b in bus_ids if per_bus[b]['line_id'] == l]
+        per_line_sim_violation_wh[l] = sum(
+            max(0.0, BUS_MIN_SOC_FRACTION * per_bus[b]['sim_battery_wh']
+                - per_bus[b]['min_soc_wh'])
+            for b in lb
+        )
 
-    # MAP weight: based on worst-case observed MAP SOC deficit
-    map_sim_cap = max(1.0, sim_map_battery_wh)
-    map_min_threshold_wh = MAP_MIN_SOC_FRACTION * map_sim_cap
+    total_sim_violation_wh = sum(per_line_sim_violation_wh.values())
     if per_map:
         worst_map_soc_wh = min(mdata['min_soc_wh'] for mdata in per_map.values())
-        if worst_map_soc_wh < map_min_threshold_wh:
-            map_deficit_frac = (map_min_threshold_wh - worst_map_soc_wh) / map_sim_cap
-            phase_a_weight_map = max(map_deficit_frac, PHASE_A_BASELINE_WEIGHT)
-        else:
-            phase_a_weight_map = PHASE_A_BASELINE_WEIGHT
-    else:
-        phase_a_weight_map = PHASE_A_BASELINE_WEIGHT
-
-    # Per-line Phase A weights:
-    #   w_l = max(total_line_deficit / total_line_capacity, PHASE_A_BASELINE_WEIGHT)
-    # Lines with the largest aggregate SOC shortfall relative to their total
-    # battery capacity receive the highest per-Wh penalty, steering the solver
-    # toward increasing battery or MAP fleet for the most-deficient lines first.
-    phase_a_weights_line = {}
-    for l in line_ids:
-        line_buses = [b for b in bus_ids if per_bus[b]['line_id'] == l]
-        if not line_buses:
-            phase_a_weights_line[l] = PHASE_A_BASELINE_WEIGHT
-            continue
-        total_line_cap_wh = max(1.0,
-            sum(per_bus[b]['sim_battery_wh'] for b in line_buses))
-        min_soc_thresh_total = BUS_MIN_SOC_FRACTION * total_line_cap_wh
-        actual_min_soc_total = sum(per_bus[b]['min_soc_wh'] for b in line_buses)
-        if actual_min_soc_total < min_soc_thresh_total:
-            line_deficit_frac = (min_soc_thresh_total - actual_min_soc_total) / total_line_cap_wh
-            phase_a_weights_line[l] = max(line_deficit_frac, PHASE_A_BASELINE_WEIGHT)
-        else:
-            phase_a_weights_line[l] = PHASE_A_BASELINE_WEIGHT
-
-    phase_a_obj = (gp.quicksum(phase_a_weights_bus[b] * s_bus[b] for b in bus_ids)
-                   + phase_a_weight_map * s_map
-                   + gp.quicksum(phase_a_weights_line[l] * s_line[l] for l in line_ids))
+        total_sim_violation_wh += max(
+            0.0, MAP_MIN_SOC_FRACTION * sim_map_battery_wh - worst_map_soc_wh)
 
     # ---------------------------------------------------------------
-    # Phase B – minimise cost subject to zero violations (primary phase)
+    # Phase A objective: minimise total energy deficit (Wh)
     #
-    # Pin all slack variables to (near-)zero so the solver must find a
-    # fully feasible solution before minimising cost.
+    # Each slack variable equals the residual Wh shortfall at the chosen
+    # battery/MAP sizing.  Summing them with unit weights gives an objective
+    # whose value is directly interpretable as "total Wh still below threshold
+    # after optimisation".  When this reaches zero the sizing is fully feasible.
     # ---------------------------------------------------------------
-    print("\n  [Phase B] Enforcing feasibility and minimising total cost ...")
+    phase_a_obj = (gp.quicksum(s_bus[b] for b in bus_ids)
+                   + s_map
+                   + gp.quicksum(s_line[l] for l in line_ids))
+
+    # ---------------------------------------------------------------
+    # Phase A – minimise total energy deficit (always runs first)
+    #
+    # Minimise the sum of all slack variables (= total residual Wh deficit
+    # below the SOC target).  When the result is ≤ FEASIBILITY_EPSILON_WH
+    # the sizing is considered fully feasible and Phase B takes over to
+    # minimise cost.
+    # ---------------------------------------------------------------
+    print(f"\n  Simulation SOC deficit (before MILP):  "
+          f"{total_sim_violation_wh / 1000:.3f} kWh across all buses/MAPs")
+    print("\n  [Phase A] Minimising total energy deficit ...")
+    model.setObjective(phase_a_obj, GRB.MINIMIZE)
+    model.optimize()
+
+    # ---------------------------------------------------------------
+    # Phase A infeasible – return early with error status
+    # ---------------------------------------------------------------
+    if model.status not in (GRB.OPTIMAL, GRB.SUBOPTIMAL):
+        return {
+            'status': ('infeasible' if model.status == GRB.INFEASIBLE
+                       else f'gurobi_status_{model.status}'),
+            'objective_value': None,
+            'phase': 'A',
+            'phase_a_violation_wh': total_sim_violation_wh,
+            'milp_residual_violation_wh': None,
+            'sim_total_deficit_wh': total_sim_violation_wh,
+            'sim_per_line_deficit_wh': per_line_sim_violation_wh,
+            'total_violation_wh': None,
+        }
+
+    milp_residual_a = (
+        sum(s_bus[b].X for b in bus_ids)
+        + s_map.X
+        + sum(s_line[l].X for l in line_ids)
+    )
+    print(f"  [Phase A] Residual deficit after optimisation: "
+          f"{milp_residual_a:.2f} Wh"
+          + (" (fully feasible)" if milp_residual_a <= FEASIBILITY_EPSILON_WH
+             else " (infeasible at given bounds)"))
+
+    # ---------------------------------------------------------------
+    # Phase B – minimise cost subject to zero violations
+    #
+    # Only entered when Phase A achieved a residual ≤ FEASIBILITY_EPSILON_WH.
+    # If Phase A could not drive the residual to zero (bounds too tight),
+    # skip Phase B and return the Phase A result directly.
+    # Pin all slack variables to (near-)zero so the solver must maintain
+    # feasibility while minimising cost.  Cost minimisation drives battery
+    # sizes down to the smallest values that keep min SOC ≈ BUS_SOC_TARGET.
+    # ---------------------------------------------------------------
+    if milp_residual_a > FEASIBILITY_EPSILON_WH:
+        # Phase A could not achieve feasibility – return Phase A result now
+        # rather than running Phase B (which would be guaranteed to fail).
+        print(f"\n  [Phase B] Skipped – Phase A residual ({milp_residual_a:.2f} Wh) "
+              f"> epsilon ({FEASIBILITY_EPSILON_WH:.1f} Wh); "
+              f"reporting Phase A minimum-deficit sizing.")
+
+        bus_bat_a = {l: B[l].X for l in line_ids}
+        n_map_val_a = int(round(N_map.X))
+        b_map_val_a = B_map.X
+        e_overnight_val_a = E_overnight.X
+        per_line_milp_slack_a = {l: s_line[l].X for l in line_ids}
+        per_bus_slack_a = {b: s_bus[b].X for b in bus_ids}
+        map_slack_a = s_map.X
+        n_bus_v_a = sum(int(round(v_bus[b].X)) for b in bus_ids)
+        n_map_v_a = int(round(v_map.X))
+        cost_bus_bat_a = sum(BATTERY_COST_PER_KWH * bus_bat_a[l] * per_line[l]['num_buses']
+                             for l in line_ids)
+        cost_map_bat_a = BATTERY_COST_PER_KWH * n_map_val_a * b_map_val_a
+        cost_map_hw_a = MAP_HARDWARE_COST * n_map_val_a
+        cost_penalty_a = (BUS_SOC_VIOLATION_PENALTY * n_bus_v_a
+                          + MAP_SOC_VIOLATION_PENALTY * n_map_v_a)
+
+        return {
+            'status': 'optimal' if model.status == GRB.OPTIMAL else 'suboptimal',
+            'objective_value': model.objVal,
+            'bus_battery_kwh': bus_bat_a,
+            'map_battery_kwh': b_map_val_a,
+            'num_maps': n_map_val_a,
+            'overnight_energy_kwh': e_overnight_val_a / 1000.0,
+            'charger_power_kw': charger_power_kw,
+            'charger_cost_per_kw': charger_cost_per_kw,
+            'per_bus_charger_cost': per_bus_charger_cost,
+            'phase': 'A',
+            'phase_a_violation_wh': total_sim_violation_wh,
+            'milp_residual_violation_wh': milp_residual_a,
+            'sim_total_deficit_wh': total_sim_violation_wh,
+            'sim_per_line_deficit_wh': per_line_sim_violation_wh,
+            'total_violation_wh': milp_residual_a,
+            'phase_a_per_line_deficit_wh': per_line_milp_slack_a,
+            'phase_a_per_bus_slack_wh': per_bus_slack_a,
+            'phase_a_map_slack_wh': map_slack_a,
+            'total_cost_breakdown': {
+                'bus_battery_cost': cost_bus_bat_a,
+                'map_battery_cost': cost_map_bat_a,
+                'map_hardware_cost': cost_map_hw_a,
+                'overnight_cost': per_bus_charger_cost * num_buses,
+                'penalty_cost': cost_penalty_a,
+                'bus_soc_violations': n_bus_v_a,
+                'map_soc_violations': n_map_v_a,
+            },
+        }
+
+    print("\n  [Phase B] Phase A feasible – minimising total cost ...")
 
     for b in bus_ids:
         model.addConstr(s_bus[b] <= FEASIBILITY_EPSILON_WH,
@@ -710,7 +810,6 @@ def run_milp_optimization(sim_data,
     # ---------------------------------------------------------------
     if model.status in (GRB.OPTIMAL, GRB.SUBOPTIMAL):
         # Phase B found a feasible, cost-optimal solution.
-        current_phase = 'B'
         phase_b_status = ('optimal' if model.status == GRB.OPTIMAL
                           else 'suboptimal')
 
@@ -729,7 +828,7 @@ def run_milp_optimization(sim_data,
         n_map_violations = int(round(v_map.X))
         cost_penalty = (BUS_SOC_VIOLATION_PENALTY * n_bus_violations
                         + MAP_SOC_VIOLATION_PENALTY * n_map_violations)
-        total_violation_final_wh = (
+        milp_residual_b = (
             sum(s_bus[b].X for b in bus_ids)
             + s_map.X
             + sum(s_line[l].X for l in line_ids)
@@ -749,8 +848,13 @@ def run_milp_optimization(sim_data,
             'charger_cost_per_kw': charger_cost_per_kw,
             'per_bus_charger_cost': per_bus_charger_cost,
             'phase': 'B',
-            'phase_a_violation_wh': 0.0,
-            'total_violation_wh': total_violation_final_wh,
+            # phase_a_violation_wh = simulation-based deficit (always non-zero
+            # when buses ran below 20% SOC in the original simulation)
+            'phase_a_violation_wh': total_sim_violation_wh,
+            'milp_residual_violation_wh': milp_residual_b,
+            'sim_total_deficit_wh': total_sim_violation_wh,
+            'sim_per_line_deficit_wh': per_line_sim_violation_wh,
+            'total_violation_wh': milp_residual_b,
             'total_cost_breakdown': {
                 'bus_battery_cost': cost_bus_bat,
                 'map_battery_cost': cost_map_bat,
@@ -763,13 +867,15 @@ def run_milp_optimization(sim_data,
         }
 
     # ---------------------------------------------------------------
-    # Phase B infeasible – fall back to Phase A
+    # Phase B infeasible – report Phase A result
     #
-    # Remove Phase B pin constraints so the slack variables are free,
-    # then minimise the weighted deficit per line (and per bus / MAP).
+    # Phase A already found the minimum-deficit sizing; Phase B could not
+    # find a cost-optimal solution within the pinned-slack constraints.
+    # Remove Phase B pin constraints and re-solve Phase A to recover the
+    # Phase A solution values (Phase A result was consumed by Phase B attempt).
     # ---------------------------------------------------------------
     print(f"  [Phase B] No feasible solution found (Gurobi status={model.status}) – "
-          f"falling back to Phase A (minimise deficit per line) ...")
+          f"reporting Phase A minimum-deficit solution ...")
 
     for b in bus_ids:
         c = model.getConstrByName(f"phase_b_viol_bus_{b}")
@@ -789,11 +895,6 @@ def run_milp_optimization(sim_data,
                 if c is not None:
                     model.remove(c)
 
-    # ---------------------------------------------------------------
-    # Phase A – minimise weighted sum of per-line (and per-bus / MAP)
-    #           SOC deficits
-    # ---------------------------------------------------------------
-    print("\n  [Phase A] Minimizing simulation-derived SOC violation weights ...")
     model.setObjective(phase_a_obj, GRB.MINIMIZE)
     model.optimize()
 
@@ -803,11 +904,14 @@ def run_milp_optimization(sim_data,
                        else f'gurobi_status_{model.status}'),
             'objective_value': None,
             'phase': 'A',
-            'phase_a_violation_wh': None,
+            'phase_a_violation_wh': total_sim_violation_wh,
+            'milp_residual_violation_wh': None,
+            'sim_total_deficit_wh': total_sim_violation_wh,
+            'sim_per_line_deficit_wh': per_line_sim_violation_wh,
             'total_violation_wh': None,
         }
 
-    phase_a_violation_wh = (
+    milp_residual_final = (
         sum(s_bus[b].X for b in bus_ids)
         + s_map.X
         + sum(s_line[l].X for l in line_ids)
@@ -817,31 +921,29 @@ def run_milp_optimization(sim_data,
     n_map_val = int(round(N_map.X))
     b_map_val = B_map.X
     e_overnight_val = E_overnight.X
-    per_line_deficit_wh = {l: s_line[l].X for l in line_ids}
+    per_line_milp_slack_wh = {l: s_line[l].X for l in line_ids}
     per_bus_slack_wh = {b: s_bus[b].X for b in bus_ids}
     map_slack_wh = s_map.X
 
-    # Total simulation deficit across all lines (raw energy draw from batteries
-    # before any resizing).  This is non-zero whenever buses ran low on charge;
-    # it is NOT the same as phase_a_violation_wh, which is the residual
-    # infeasibility AFTER Phase A has been allowed to resize batteries.
-    total_sim_deficit_wh = sum(sim_line_deficit_wh.values())
-
-    print(f"\n  [Phase A] Simulation deficit (input):  {total_sim_deficit_wh / 1000:.3f} kWh"
-          f"  ← raw energy draw that exceeded 20% SOC threshold across all lines")
-    print(f"  [Phase A] MILP residual violation:     {phase_a_violation_wh:.2f} Wh"
-          f"  ← remaining infeasibility after Phase A battery resizing"
-          f" {'(= 0: all deficits resolved by upsizing)' if phase_a_violation_wh < FEASIBILITY_EPSILON_WH else ''}")
+    print(f"\n  [Phase A] Simulation SOC deficit (original sizing): "
+          f"{total_sim_violation_wh / 1000:.3f} kWh"
+          f"  ← energy buses were below 20% SOC threshold")
+    print(f"  [Phase A] MILP residual deficit (after resizing):  "
+          f"{milp_residual_final:.2f} Wh"
+          + (" (all deficits resolved)" if milp_residual_final <= FEASIBILITY_EPSILON_WH
+             else " (residual infeasibility within given bounds)"))
     print(f"\n  [Phase A] Suggested sizing values:")
     print(f"    MAP battery capacity: {b_map_val:.1f} kWh")
     print(f"    Number of MAPs:       {n_map_val}")
     for l in sorted(line_ids):
-        sim_def = sim_line_deficit_wh.get(l, 0.0)
-        milp_slack = per_line_deficit_wh[l]
-        status_str = ("deficit covered" if milp_slack < FEASIBILITY_EPSILON_WH
+        sim_viol = per_line_sim_violation_wh.get(l, 0.0)
+        sim_draw = sim_line_deficit_wh.get(l, 0.0)
+        milp_slack = per_line_milp_slack_wh[l]
+        status_str = ("deficit covered" if milp_slack <= FEASIBILITY_EPSILON_WH
                       else f"remaining = {milp_slack / 1000:.3f} kWh")
         print(f"    Line {l}: bus battery = {bus_bat[l]:.1f} kWh  "
-              f"(sim deficit = {sim_def / 1000:.3f} kWh, {status_str})")
+              f"(sim SOC violation = {sim_viol / 1000:.3f} kWh, "
+              f"total draw = {sim_draw / 1000:.3f} kWh, {status_str})")
     if map_slack_wh > FEASIBILITY_EPSILON_WH:
         print(f"    MAP remaining deficit: {map_slack_wh / 1000:.3f} kWh")
 
@@ -858,7 +960,8 @@ def run_milp_optimization(sim_data,
     final_status = 'optimal' if model.status == GRB.OPTIMAL else 'suboptimal'
 
     print(f"  [Phase A] Final solution  "
-          f"violation={phase_a_violation_wh:.2f} Wh  "
+          f"sim_violation={total_sim_violation_wh:.2f} Wh  "
+          f"milp_residual={milp_residual_final:.2f} Wh  "
           f"status={final_status}")
 
     return {
@@ -872,9 +975,14 @@ def run_milp_optimization(sim_data,
         'charger_cost_per_kw': charger_cost_per_kw,
         'per_bus_charger_cost': per_bus_charger_cost,
         'phase': 'A',
-        'phase_a_violation_wh': phase_a_violation_wh,
-        'total_violation_wh': phase_a_violation_wh,
-        'phase_a_per_line_deficit_wh': per_line_deficit_wh,
+        # phase_a_violation_wh = simulation-based deficit (the root cause the user
+        # reported as "0.00 Wh" – now correctly reflects actual SOC violation)
+        'phase_a_violation_wh': total_sim_violation_wh,
+        'milp_residual_violation_wh': milp_residual_final,
+        'sim_total_deficit_wh': total_sim_violation_wh,
+        'sim_per_line_deficit_wh': per_line_sim_violation_wh,
+        'total_violation_wh': milp_residual_final,
+        'phase_a_per_line_deficit_wh': per_line_milp_slack_wh,
         'phase_a_per_bus_slack_wh': per_bus_slack_wh,
         'phase_a_map_slack_wh': map_slack_wh,
         'total_cost_breakdown': {
@@ -894,6 +1002,7 @@ def run_milp_optimization(sim_data,
 # ========================
 
 def post_simulation_optimize(results, stage2_sim, bus_lines,
+                             min_maps=1,
                              max_maps=20,
                              bus_cap_min_kwh=50.0,
                              bus_cap_max_kwh=500.0,
@@ -911,6 +1020,8 @@ def post_simulation_optimize(results, stage2_sim, bus_lines,
         The simulation object.
     bus_lines : list[BusLineData]
         Bus line metadata.
+    min_maps : int
+        Hard lower bound on the number of MAPs.  Defaults to 1.
     max_maps : int
         Maximum number of MAPs to consider.
     bus_cap_min_kwh, bus_cap_max_kwh : float
@@ -977,6 +1088,7 @@ def post_simulation_optimize(results, stage2_sim, bus_lines,
     # --- solve ---
     opt_results = run_milp_optimization(
         sim_data,
+        min_maps=min_maps,
         max_maps=max_maps,
         bus_cap_min_kwh=bus_cap_min_kwh,
         bus_cap_max_kwh=bus_cap_max_kwh,
@@ -992,28 +1104,34 @@ def post_simulation_optimize(results, stage2_sim, bus_lines,
 
     if opt_results['objective_value'] is not None:
         phase_label = opt_results.get('phase', '?')
-        total_viol = opt_results.get('total_violation_wh', 0.0)
-        print(f"\nStatus:          {opt_results['status']}")
-        print(f"Optimizer phase: {phase_label}")
+        sim_viol = opt_results.get('phase_a_violation_wh', 0.0) or 0.0
+        milp_res = opt_results.get('milp_residual_violation_wh', 0.0) or 0.0
+        print(f"\nStatus:                      {opt_results['status']}")
+        print(f"Optimizer phase:             {phase_label}")
+        print(f"Simulation SOC deficit:      {sim_viol / 1000:.3f} kWh"
+              f"  ← energy buses were below 20% SOC in original simulation")
+        print(f"MILP residual after sizing:  {milp_res:.2f} Wh"
+              + (" (all deficits covered)" if milp_res <= FEASIBILITY_EPSILON_WH
+                 else " (residual infeasibility)"))
 
         if phase_label == 'A':
             # Phase B was infeasible; report Phase A suggested values.
-            print(f"\n  *** No feasible solution found (Phase B infeasible). ***")
-            print(f"  Phase A minimised the per-line deficit "
-                  f"(total remaining violation: {total_viol:.2f} Wh).")
+            print(f"\n  *** Phase B infeasible – reporting minimum-deficit sizing. ***")
             print(f"\n  Phase A Suggested Sizing:")
             print(f"    MAP battery capacity: {opt_results['map_battery_kwh']:.1f} kWh")
             print(f"    Number of MAPs:       {opt_results['num_maps']}")
-            per_line_deficit = opt_results.get('phase_a_per_line_deficit_wh', {})
-            print(f"\n    Per-Line Bus Battery Capacities and Remaining Deficits:")
+            per_line_milp = opt_results.get('phase_a_per_line_deficit_wh', {})
+            per_line_sim = opt_results.get('sim_per_line_deficit_wh', {})
+            print(f"\n    Per-Line Bus Battery Capacities and Deficits:")
             for lid, cap in sorted(opt_results['bus_battery_kwh'].items()):
                 n = sim_data['per_line'][lid]['num_buses']
-                deficit_kwh = per_line_deficit.get(lid, 0.0) / 1000.0
-                deficit_str = (f"  remaining deficit = {deficit_kwh:.3f} kWh"
-                               if deficit_kwh > FEASIBILITY_EPSILON_WH / 1000.0
-                               else "  (deficit covered)")
-                print(f"      Line {lid}: {cap:>7.1f} kWh  × {n} buses"
-                      f"  = {cap * n:>10.1f} kWh total{deficit_str}")
+                sv = per_line_sim.get(lid, 0.0) / 1000.0
+                mr = per_line_milp.get(lid, 0.0) / 1000.0
+                covered = mr <= FEASIBILITY_EPSILON_WH / 1000.0
+                status_str = "(covered)" if covered else f"residual={mr:.3f} kWh"
+                print(f"      Line {lid}: {cap:>7.1f} kWh × {n} buses"
+                      f"  = {cap * n:>10.1f} kWh total"
+                      f"  sim_deficit={sv:.3f} kWh  {status_str}")
             map_slack_kwh = opt_results.get('phase_a_map_slack_wh', 0.0) / 1000.0
             if map_slack_kwh > FEASIBILITY_EPSILON_WH / 1000.0:
                 print(f"    MAP remaining deficit: {map_slack_kwh:.3f} kWh")
@@ -1024,10 +1142,12 @@ def post_simulation_optimize(results, stage2_sim, bus_lines,
             print(f"Total Objective (Cost): ${opt_results['objective_value']:,.2f}")
 
             print("\nOptimal Bus Battery Capacities (per line):")
+            per_line_sim = opt_results.get('sim_per_line_deficit_wh', {})
             for lid, cap in sorted(opt_results['bus_battery_kwh'].items()):
                 n = sim_data['per_line'][lid]['num_buses']
+                sv = per_line_sim.get(lid, 0.0) / 1000.0
                 print(f"  Line {lid}: {cap:>7.1f} kWh  × {n} buses  "
-                      f"= {cap * n:>10.1f} kWh total")
+                      f"= {cap * n:>10.1f} kWh total  (sim_deficit={sv:.3f} kWh)")
 
             print(f"\nOptimal MAP Battery Capacity: "
                   f"{opt_results['map_battery_kwh']:.1f} kWh")
