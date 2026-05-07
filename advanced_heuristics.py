@@ -373,9 +373,18 @@ class AdvancedMAPScheduler:
           - Travel-time feasibility (MAP can reach in time for the layover)
           - MAP energy conservation (avoid draining a MAP that other
             buses will need soon)
+
+        When ``layover_duration_s`` is 0 the call comes from a dynamic
+        (en-route) charging request.  In that case the MAP will follow
+        the bus across segments and stops, so the travel-time feasibility
+        check is relaxed and deliverable energy is estimated from
+        available MAP energy alone.
         """
         if self.num_maps <= 0:
             return None
+
+        # Dynamic en-route charging mode: MAP will follow the bus, no fixed window
+        is_enroute_charging = (layover_duration_s <= 0)
 
         best_map = None
         best_score = -1.0
@@ -394,14 +403,19 @@ class AdvancedMAPScheduler:
                 map_loc, stop_id
             )
 
-            # Can the MAP reach in time?
-            if travel_time_s > layover_duration_s * 0.9:
-                continue  # Won't arrive with meaningful time to charge
+            if is_enroute_charging:
+                # Dynamic mode: MAP follows the bus, so deliverable is
+                # the full available MAP energy (no time window limit)
+                deliverable = avail
+            else:
+                # Can the MAP reach in time?
+                if travel_time_s > layover_duration_s * 0.9:
+                    continue  # Won't arrive with meaningful time to charge
 
-            remaining_charge_time = max(0, layover_duration_s - travel_time_s)
-            deliverable = min(avail, remaining_charge_time * self.charging_rate_wh_s)
-            if deliverable <= 0:
-                continue
+                remaining_charge_time = max(0, layover_duration_s - travel_time_s)
+                deliverable = min(avail, remaining_charge_time * self.charging_rate_wh_s)
+                if deliverable <= 0:
+                    continue
 
             # --- Scoring components ---
 
@@ -464,11 +478,19 @@ class AdvancedMAPScheduler:
           - How much energy the bus needs for its remaining trips
           - How much the MAP can deliver within the layover
           - How much energy the MAP should conserve for other buses
+
+        When ``layover_duration_s`` is 0 the call is for dynamic
+        (en-route) charging where the MAP follows the bus.  In that
+        case the deliverable limit is based on MAP energy alone.
         """
 
         # Maximum energy the MAP can deliver (limited by its SOC and rate)
         avail_map = self.map_sched.available_energy_wh(map_id)
-        max_deliverable = min(avail_map, layover_duration_s * self.charging_rate_wh_s)
+        if layover_duration_s > 0:
+            max_deliverable = min(avail_map, layover_duration_s * self.charging_rate_wh_s)
+        else:
+            # Dynamic mode: MAP follows the bus, deliverable is full MAP energy
+            max_deliverable = avail_map
 
         # Energy the bus needs to finish its day with >= 20% SOC
         safe_margin = BUS_MIN_SOC * capacity_wh
