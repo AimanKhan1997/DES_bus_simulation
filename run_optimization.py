@@ -1,6 +1,5 @@
 """
 Run Terminal-Only Charging with INTEGRATED Optimized Preemption Strategy
-WITH CONSTRAINT-DRIVEN FEASIBILITY SEARCH (no MILP optimization)
 
 Modes:
     python run_optimization.py --sim-only   Run a single simulation without the feedback loop (validation mode)
