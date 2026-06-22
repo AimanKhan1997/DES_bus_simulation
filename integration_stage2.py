@@ -4,6 +4,7 @@ WITH MAP MOVEMENT, ROUTE-BASED CHARGING, AND ADVANCED TRACKING
 """
 
 import simpy
+import time
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -28,7 +29,7 @@ CHARGER_SPEED_MS = 37.78
 ENERGY_PER_METER_WH = 2.7  # default (for 470 kWh battery)
 ENERGY_PER_METER_MAP_WH = 0.1  # MAPs CONSUMPTION RATE
 
-MAP_BATTERY_CAPACITY_WH = 500000   # 150 kWh per MAP
+MAP_BATTERY_CAPACITY_WH = 290000   # 150 kWh per MAP
 MAP_MIN_SOC = 0.10                 # MAP cannot go below 10% SOC
 MAP_SELF_CHARGE_RATE_WH_S = 233.0  # MAP self-charges at 233 Wh/s
 
@@ -1510,10 +1511,14 @@ class Stage2DESTerminalChargingPreemptive:
             self.env.process(self._simulate_bus(bus_id, trip_ids))
 
         print(f"Running simulation until t={duration_s}s...")
+        _des_start = time.perf_counter()
         self.env.run(until=duration_s)
-        print(f"Simulation complete!\n")
+        _des_elapsed = time.perf_counter() - _des_start
+        print(f"Simulation complete!")
+        print(f"DES computation time: {_des_elapsed:.3f} s\n")
 
         stats = self._collect_statistics()
+        stats['des_computation_time_s'] = _des_elapsed
 
         return stats
 
@@ -2157,21 +2162,6 @@ class Stage2DESTerminalChargingPreemptive:
         cbar = plt.colorbar(sc, ax=ax, shrink=0.8, pad=0.02)
         cbar.set_label('Number of self-charge events', fontweight='bold', fontsize=11)
 
-        # Annotate stops with high usage
-        # max_count = max(counts)
-        # for lon, lat, count, label in zip(lons, lats, counts, labels):
-        #     if count >= max(2, max_count * 0.5):
-        #         ax.annotate(
-        #             f'{label}\n({count})',
-        #             (lon, lat),
-        #             textcoords="offset points",
-        #             xytext=(8, 8),
-        #             fontsize=7,
-        #             fontweight='bold',
-        #             bbox=dict(boxstyle='round,pad=0.2', facecolor='white',
-        #                       edgecolor='gray', alpha=0.8),
-        #         )
-
         ax.set_xlabel('Longitude', fontweight='bold', fontsize=12)
         ax.set_ylabel('Latitude', fontweight='bold', fontsize=12)
         ax.set_title('MAP Self-Charge Location Heatmap (Bus Route Network)',
@@ -2238,17 +2228,6 @@ def run_terminal_charging_simulation(sim, bus_trips_dict, bus_lines, trip_change
     )
 
     results = stage2.run_simulation(simulation_duration_s)
-
-    # Print all outputs
-    # stage2.print_first_layovers(num_to_print=5)
-    # stage2.print_charging_events(num_to_print=10)
-    # stage2.print_preemption_events()
-    #
-    # # Print MAP usage
-    # stage2.print_map_usage()
-    # stage2.print_map_assignments()
-    # stage2.print_map_movement()  # NEW: Print MAP movement statistics
-    # stage2.print_bus_charging_schedule(num_to_print=5)
 
     # Print simulation results
     print("\n" + "="*70)
