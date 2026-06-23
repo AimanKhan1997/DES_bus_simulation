@@ -1,203 +1,126 @@
-# DES Bus Simulation
+# DES Bus Simulation — Experiments for
+Joint Optimization of Bus Batteries and Mobile Autonomous Charging Pods for Urban Bus Electrification
 
-A Discrete Event Simulation (DES) framework coupled with Mixed-Integer Linear Programming (MILP) optimization for planning electric bus charging infrastructure. The system simulates daily bus operations on Stockholm transit lines, models energy consumption and Mobile Access Point (MAP) scheduling, and optimizes battery capacities and infrastructure costs.
+This repository contains the experimental code used in the paper
+"Joint Optimization of Bus Batteries and Mobile Autonomous Charging Pods for Urban Bus Electrification".
+It implements a two-level feasibility study that couples a discrete-event simulation (DES) of bus operations with heuristics and optimization routines to jointly reason about bus battery sizing and Mobile Access Point (MAP) deployment and usage.
 
-## Overview
+Short summary
+- Main heuristic / experiment driver: `run_optimization.py` (constraint-driven search and refinement loop; also supports simulation-only mode).
+- Discrete-event simulation (Stage 2): `integration_stage2.py` (SimPy-based terminal charging, preemptive charging logic, MAP simulation and plotting utilities).
+- Rolling-horizon, advanced MAP scheduling heuristic: `advanced_heuristics.py` (a dynamic scheduler that replaces the greedy MAP heuristic).
 
-Electric bus fleet planning requires balancing battery sizing, charging infrastructure investment, and operational feasibility. This project addresses that problem by:
+This README summarizes how to run the experiments, reproduce the results, and what to expect from the outputs.
 
-1. **Simulating** a full day of bus operations using a SimPy-based discrete event simulation that tracks energy consumption, state-of-charge (SOC), and charging events.
-2. **Optimizing** battery capacities and MAP (Mobile Access Point) deployment using a Gurobi-based MILP solver that minimizes total system cost.
-3. **Iterating** between simulation and optimization in a feedback loop to converge on a feasible, cost-optimal solution.
+--
 
-## Architecture
+## Stack
+- Language: Python (3.10+ recommended)
+- Key libraries: simpy, pandas, numpy, networkx/osmnx, geopandas/shapely, gurobipy (optional for full MILP flows)
 
-```
-┌───────────────────────────────────────────────┐
-│           run_optimization.py (Entry Point)   │
-│            MILP ↔ Simulation Feedback Loop     │
-└──────────┬──────────────────────┬─────────────┘
-           │                      │
-    ┌──────▼──────┐      ┌───────▼──────────┐
-    │  Stage 2 DES │      │  Gurobi MILP     │
-    │  Simulation  │◄────►│  Optimizer       │
-    └──────┬──────┘      └──────────────────┘
-           │
-    ┌──────▼──────────────────────────────┐
-    │  Stage2DESTerminalChargingPreemptive │
-    │  (integration_stage2.py)            │
-    │  • Bus movement & energy tracking   │
-    │  • Terminal charging simulation     │
-    │  • Preemptive charging strategies   │
-    │  • MAP movement scheduling          │
-    └──────┬──────────────────────────────┘
-           │
-    ┌──────▼─────────────────┐
-    │  GTFSBusSim (DES_model) │
-    │  • SimPy bus processes  │
-    │  • Energy consumption   │
-    │  • Charging management  │
-    └──────┬─────────────────┘
-           │
-     ┌─────┼──────────────┐
-     │     │              │
- ┌───▼──┐ ┌▼────────┐ ┌──▼──────────┐
- │ GTFS │ │OSM Graph│ │Trip Assign  │
- │Loader│ │(Routing)│ │(Scheduling) │
- └──────┘ └─────────┘ └─────────────┘
-```
+Notes: The core simulation is pure-Python and uses SimPy. Gurobi is only required if you want to run/extend MILP-based optimization routines — the provided constraint-driven search in `run_optimization.py` can run without calling a MILP solver.
 
-## Project Structure
+## What is here (top-level files)
+- `run_optimization.py` — Main experiment driver. Orchestrates simulation runs, constraint-driven feasibility search, and the greedy refinement phases. Also supports `--sim-only` mode to validate parameters.
+- `integration_stage2.py` — Stage 2 discrete-event simulation (terminal charging, preemptive charging, MAP movement/energy tracking, plotting helpers).
+- `advanced_heuristics.py` — Rolling-horizon MAP scheduler (dynamic thresholds, multi-criteria MAP selection). Can be integrated into the stage-2 simulation as an alternative MAP scheduling policy.
+- `DES_model.py` — Core DES building blocks (GTFS-based bus processes, energy model, helpers used by stage-2).
+- `Trip_assign.py` — Trip assignment utilities used to create bus schedules from GTFS.
+- `gtfs_loader.py` — GTFS parsing and feed helpers.
+- `osm_graph.py` — OSMnx / NetworkX wrapper for routing and stop snapping.
 
-| File | Description |
-|------|-------------|
-| `run_optimization.py` | Main entry point. Orchestrates the MILP ↔ Simulation feedback loop. |
-| `integration_stage2.py` | Stage 2 DES simulation with terminal charging, preemptive strategies, and MAP scheduling. |
-| `post_simulation_milp.py` | Gurobi-based MILP optimizer for battery capacity and infrastructure cost minimization. |
-| `DES_model.py` | Core simulation framework (`GTFSBusSim`). Handles bus processes, energy consumption, and GTFS integration. |
-| `advanced_heuristics.py` | Rolling-horizon MAP scheduler with dynamic charge thresholds (alternative to fixed 70%/80%). |
-| `gtfs_loader.py` | GTFS data loader with service calendar and date filtering. |
-| `Trip_assign.py` | Trip-to-bus assignment algorithm based on line, turnover time, and schedule. |
-| `osm_graph.py` | OpenStreetMap graph wrapper using OSMnx/NetworkX for routing and stop snapping. |
-
-## Prerequisites
-
-- **Python 3.10+**
-- **Gurobi** optimizer with a valid license (required for MILP optimization)
-
-### Python Dependencies
-
-| Package | Purpose |
-|---------|---------|
-| `simpy` | Discrete event simulation engine |
-| `pandas` | GTFS data parsing and manipulation |
-| `numpy` | Numerical operations |
-| `matplotlib` | Visualization (SOC plots, heatmaps) |
-| `networkx` | Graph algorithms for routing |
-| `osmnx` | OpenStreetMap street network loading |
-| `geopandas` | Geospatial data handling |
-| `shapely` | Geometric operations |
-| `pyproj` | Geographic coordinate transformations |
-| `gurobipy` | Gurobi MILP solver Python interface |
-
-Install dependencies with:
+## Quick start — dependencies
+Install required packages (example):
 
 ```bash
-pip install simpy pandas numpy matplotlib networkx osmnx geopandas shapely pyproj gurobipy
+pip install simpy pandas numpy matplotlib networkx osmnx geopandas shapely pyproj
 ```
 
-## Input Data
+If you want to use Gurobi-based optimization (optional): install Gurobi and its Python interface `gurobipy` and ensure a valid license is available.
 
-The simulation requires two data sources placed in the repository root:
+## Input data (required to run experiments)
+Place the following in the repository root (or change the paths in `run_optimization.py`):
 
-### GTFS Data (`gtfs_data/`)
+- GTFS feed folder (example path used in code: `gtfs_data/`) containing standard GTFS files: `stops.txt`, `stop_times.txt`, `trips.txt`, `routes.txt`, `shapes.txt`, `calendar.txt`, `calendar_dates.txt`.
+- OpenStreetMap network export covering the study area (example filename in code: `map.xml`).
 
-Standard [GTFS](https://gtfs.org/) transit feed files:
+The example scripts are set up to run experiments with Stockholm lines (see `run_optimization.py` constants); change `LINES`, `DATE_STR`, or GTFS path to run with other feeds/dates.
 
-- `stops.txt` — Transit stop locations (lat/lon)
-- `stop_times.txt` — Trip stop sequences with arrival/departure times
-- `trips.txt` — Trip metadata (route, service ID, direction)
-- `routes.txt` — Route definitions (route short name)
-- `shapes.txt` — Route geometry (lat/lon point sequences)
-- `calendar.txt` — Service calendar (date ranges, day-of-week flags)
-- `calendar_dates.txt` — Service exceptions and overrides
+## Running the experiments
+From a fresh clone with required data placed as above, the most common entry points are:
 
-### OpenStreetMap Network (`map.xml`)
-
-An OSM XML export covering the transit area, used for shortest-path routing between stops.
-
-## Usage
-
-### Full Optimization (MILP ↔ Simulation Loop)
-
-Runs iterative optimization to find cost-optimal battery capacities and MAP deployment:
+- Run the MILP ↔ Simulation constraint-driven loop (default):
 
 ```bash
 python run_optimization.py
 ```
 
-The loop runs up to 50 iterations:
-1. Simulates bus operations with current parameters
-2. Extracts energy and SOC data from the simulation
-3. Solves the MILP to find cheaper feasible configurations
-4. Updates parameters and re-simulates
-5. Tracks the best feasible solution across all iterations
+This executes the constraint-driven feasibility search (no external MILP required). It will:
+1. Load GTFS + map data and assign trips to buses.
+2. Run Stage-2 simulation with an initial configuration.
+3. If infeasible, diagnose causes and apply feedback constraints (increase per-line battery minima, require more MAPs, etc.).
+4. Iterate until a feasible configuration is found or max iterations are reached.
+5. Run a refinement phase to greedily minimize battery capacities, MAP count, and MAP battery energy while preserving feasibility.
 
-### Simulation Only
-
-Runs a single simulation without optimization (useful for validating specific parameters):
+- Run a single simulation (validation mode — no feedback loop):
 
 ```bash
 python run_optimization.py --sim-only
 ```
 
-## Configuration
+This mode runs a stage-2 simulation for the configured values in `run_optimization.py` and produces plots and a cost breakdown. Use this to validate specific battery / MAP configurations.
 
-Key parameters are defined as constants in the source files:
+## How the pieces fit together
+- `run_optimization.py` is the high-level experiment orchestrator. It calls into the DES (`integration_stage2.run_terminal_charging_simulation`) to evaluate candidate configurations and obtains simulation statistics.
+- `integration_stage2.py` contains the SimPy simulation of buses and MAPs. It tracks bus SOC trajectories, MAP movement & energy delivery, preemptive charging events, and plotting utilities.
+- `advanced_heuristics.py` implements a rolling-horizon MAP scheduler (dynamic start/target SOC thresholds, MAP selection by multi-criteria scoring). It can be used in place of the default greedy MAP scheduler by constructing an `AdvancedMAPScheduler` and passing it into the simulation (see `integration_stage2.py` where the scheduler is used/instantiated).
+- `DES_model.py`, `Trip_assign.py`, `gtfs_loader.py`, and `osm_graph.py` provide the GTFS/OSM integration and lower-level simulation helpers used across the experiments.
 
-### Transit Lines (`run_optimization.py`)
+## Important configuration knobs (where to look in code)
+- In `run_optimization.py`:
+  - `LINES` and `DATE_STR` — transit lines and date used for experiments.
+  - `LINE_BATTERY_CAPACITIES_KWH` — per-line starting battery capacities used by the search.
+  - `initial_capacity_wh` and `initial_num_maps` — default fallback bus capacity and starting MAP count.
 
-```python
-LINES = ["1", "2", "3", "4", "6"]           # Stockholm bus lines
-DATE_STR = "20231108"                         # Simulation date (YYYYMMDD)
-LINE_BATTERY_CAPACITIES_KWH = {               # Initial battery capacities (kWh)
-    "1": 270, "2": 130, "3": 280, "4": 200, "6": 50
-}
-```
+- In `integration_stage2.py`:
+  - Charging thresholds and constants (e.g. `BUS_CHARGE_THRESHOLD_SOC`, `BUS_CHARGE_CUTOFF_SOC`, `BUS_MIN_SOC`, `MAP_CHARGING_RATE_WH_S`, `MAX_CONCURRENT_CHARGERS`).
+  - Function/entrypoint: `run_terminal_charging_simulation(...)` which accepts parameters for number of MAPs, line-specific capacities, map battery size, and other simulation flags.
 
-### Charging Thresholds (`integration_stage2.py`)
+- In `advanced_heuristics.py`:
+  - `AdvancedMAPScheduler` — construct this scheduler with the simulation and pass it to the stage-2 simulation if you want the rolling-horizon heuristic.
 
-```python
-BUS_CHARGE_THRESHOLD_SOC = 0.70   # Start charging below 70% SOC
-BUS_CHARGE_CUTOFF_SOC = 0.80      # Stop charging above 80% SOC
-BUS_MIN_SOC = 0.20                # Minimum allowed SOC (20%)
-MAP_CHARGING_RATE_WH_S = 97.22   # MAP charging rate (Wh/s)
-MAX_CONCURRENT_CHARGERS = 2       # Max simultaneous charging sessions
-```
+## Reproducibility notes
+- Randomized initial configurations: `run_optimization.py` contains utilities to generate randomized starting points (`generate_random_initial_values`) for stress-testing the search. To run multiple seeds, call the script in a loop or add a small wrapper that sets the RNG seed and logs outputs.
+- Determinism: the simulation may rely on randomized tie-breaking. For bit-for-bit reproducibility, seed Python's `random` (and NumPy if used) and keep dataset and OSM sources identical.
+- Gurobi: full MILP-based re-optimization is optional. The repository includes a constraint-driven fallback that does not require a solver.
 
-### MILP Cost Parameters (`post_simulation_milp.py`)
+## Outputs
+By default the simulation/experiment pipeline produces the following artifacts (PNG plots and console summaries):
+- bus_soc_terminal_charging_optimized.png — SOC trajectories per bus/line
+- map_energy_delivery.png — per-MAP energy delivered over time
+- cumulative_energy_delivery.png — cumulative energy supplied by MAPs
+- map_movement_distance.png — distance travelled by each MAP
+- map_soc_over_time.png — MAP battery SOC over time
+- map_self_charge_heatmap.png — (geospatial) heatmap of MAP self-charging events
 
-```python
-BATTERY_COST_PER_KWH = 115        # $/kWh for bus/MAP batteries
-MAP_HARDWARE_COST = 40_000        # $ per MAP unit
-OVERNIGHT_CHARGING_HOURS = 4.0    # Hours available for overnight depot charging
-```
+Console outputs include a feasibility report, per-line charging statistics, MAP usage summaries, and a cost breakdown (bus batteries, MAP batteries, MAP hardware, overnight charger cost, penalties for SOC constraint violations).
 
-### Energy Model (`DES_model.py`)
+## How to use the rolling-horizon heuristic
+1. Create an instance of `AdvancedMAPScheduler` from `advanced_heuristics.py` passing the simulation (`sim`), trip assignments, battery capacities, number of MAPs, and a MAP movement scheduler implementation.
+2. Modify or call `integration_stage2.run_terminal_charging_simulation(...)` to accept and use the `AdvancedMAPScheduler` instance (the stage-2 simulation already contains hooks to plumb in alternative schedulers).
 
-Energy consumption per meter is a linear function of battery capacity:
+If you need help wiring the scheduler into a run, open an issue or point to the exact call-site in `integration_stage2.py` and I can provide a code snippet showing how to instantiate and inject the scheduler into the simulation.
 
-```
-rate = 2.7 − (470 − capacity_kwh) × 0.0005  Wh/m
-```
+## Citation
+If you use this code in research, please cite the paper:
 
-## Output
+Joint Optimization of Bus Batteries and Mobile Autonomous Charging Pods for Urban Bus Electrification
 
-### Visualizations
+(Use the citation format required by your venue; include authors, year, and DOI when available.)
 
-The simulation generates the following plots (saved as PNG at 300 DPI):
+## Contact / reproducibility help
+Open an issue describing the dataset (GTFS + OSM extract) you're using and the command you ran. If you want, include the date string and the `LINES` you supplied and paste console output; I can help debug common causes of infeasibility or guide you through producing publication figures.
 
-| Plot | Description |
-|------|-------------|
-| `bus_soc_terminal_charging_optimized.png` | Bus SOC trajectories over the simulation day, color-coded by line |
-| `map_energy_delivery.png` | Energy delivered by each MAP to buses |
-| `cumulative_energy_delivery.png` | Cumulative energy supplied by each MAP over time |
-| `map_movement_distance.png` | Distance traveled by each MAP |
-| `map_soc_over_time.png` | MAP battery SOC trajectories |
-| `map_self_charge_heatmap.png` | Geographic heatmap of MAP self-charging events on the OSM network |
+--
 
-### Console Output
-
-- Feasibility report (whether minimum SOC constraints are satisfied)
-- Per-line charging statistics and preemption events
-- MAP usage summary (assignments, movement, energy delivery)
-- Cost breakdown (battery, hardware, overnight charging infrastructure)
-- MILP solver status and recommended parameters per iteration
-
-## Key Concepts
-
-- **MAP (Mobile Access Point)**: A mobile charging unit that travels between stops to charge buses en route. MAPs have their own battery and can self-charge at designated locations.
-- **Terminal Charging**: Charging that occurs only at terminal (end-of-line) stops during bus layovers.
-- **Preemptive Charging**: Interrupting a bus's trip schedule to perform emergency charging when SOC drops critically low.
-- **Rolling-Horizon Scheduling**: An advanced heuristic that dynamically adjusts charging thresholds based on predicted future energy needs rather than using fixed SOC thresholds.
-- **Overnight Charging**: Depot charging that occurs during off-service hours, with infrastructure costs based on tiered charger pricing ($/kW).
+Prepared as the experiments README for the paper "Joint Optimization of Bus Batteries and Mobile Autonomous Charging Pods for Urban Bus Electrification".
