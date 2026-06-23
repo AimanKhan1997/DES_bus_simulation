@@ -1,5 +1,4 @@
-# DES Bus Simulation — Experiments for
-Joint Optimization of Bus Batteries and Mobile Autonomous Charging Pods for Urban Bus Electrification
+# DES Bus Simulation — Experiments for Joint Optimization of Bus Batteries and Mobile Autonomous Charging Pods for Urban Bus Electrification
 
 This repository contains the experimental code used in the paper
 "Joint Optimization of Bus Batteries and Mobile Autonomous Charging Pods for Urban Bus Electrification".
