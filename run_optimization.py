@@ -280,9 +280,9 @@ def compute_trip_change_stops(sim, bus_trips_dict):
     return trip_change_stops
 
 
-def generate_random_initial_values(bus_lines, min_bus_cap_kwh=40, max_bus_cap_kwh=500,
-                                   min_maps=2, max_maps=20, min_map_cap_kwh=90,
-                                   max_map_cap_kwh=500):
+def generate_random_initial_values(bus_lines, min_bus_cap_kwh=50, max_bus_cap_kwh=200,
+                                   min_maps=4, max_maps=13, min_map_cap_kwh=200,
+                                   max_map_cap_kwh=450):
     """
     Generate random initial values for LINE_BATTERY_CAPACITIES_KWH, number of MAPs,
     and MAP battery capacity.
@@ -581,174 +581,299 @@ def _evaluate_config_cost(sim, bus_trips, bus_lines, trip_change_stops,
     }
 
 
-def _run_refinement_pass(sim, bus_trips, bus_lines, trip_change_stops,
-                         bus_caps_kwh, num_maps, map_battery_kwh,
-                         requested_map_battery_kwh, default_bus_capacity_kwh):
+def _refinement_config_changed(start_bus_caps_kwh, start_map_battery_kwh, start_num_maps,
+                               end_bus_caps_kwh, end_map_battery_kwh, end_num_maps):
+    """Return True when a refinement pass changed any decision variable."""
+    if start_bus_caps_kwh.keys() != end_bus_caps_kwh.keys():
+        return True
+    for lid in start_bus_caps_kwh:
+        if abs(start_bus_caps_kwh[lid] - end_bus_caps_kwh[lid]) > 1e-9:
+            return True
+    if abs(start_map_battery_kwh - end_map_battery_kwh) > 1e-9:
+        return True
+    return start_num_maps != end_num_maps
+
+
+def _run_additional_refinement_passes(sim, bus_trips, bus_lines, trip_change_stops,
+                                      bus_caps_kwh, num_maps, map_battery_kwh,
+                                      default_bus_capacity_kwh,
+                                      max_refinement_passes=10):
     """
-    Run a single Phase 1 + Phase 2 (2a + 2b) + Phase 3 refinement pass.
-
-    All phases are greedy and non-increasing in total cost, so the returned
-    configuration is at least as cheap as the input.
-
-    Returns
-    -------
-    tuple (bus_caps_kwh, num_maps, map_battery_kwh, requested_map_battery_kwh)
+    Repeat Phases 1-3 from a feasible refined solution until one full pass
+    produces no further change.
     """
-    bus_caps_kwh = bus_caps_kwh.copy()
+    current_bus_caps_kwh = bus_caps_kwh.copy()
+    current_num_maps = num_maps
+    current_map_battery_kwh = map_battery_kwh
+    requested_map_battery_kwh = map_battery_kwh
+    final_results = None
+    final_stage2_sim = None
 
-    # --- Phase 1: Reduce bus battery capacities per line ---
-    print("\n--- Phase 1: Reducing bus battery capacities ---")
-    bus_caps_kwh = _refine_bus_capacities(
-        sim=sim,
-        bus_trips=bus_trips,
-        bus_lines=bus_lines,
-        trip_change_stops=trip_change_stops,
-        bus_caps_kwh=bus_caps_kwh,
-        num_maps=num_maps,
-        default_bus_capacity_kwh=default_bus_capacity_kwh,
-        requested_map_battery_kwh=requested_map_battery_kwh,
-    )
+    for refinement_pass in range(1, max_refinement_passes + 1):
+        pass_start_bus_caps_kwh = current_bus_caps_kwh.copy()
+        pass_start_map_battery_kwh = current_map_battery_kwh
+        pass_start_num_maps = current_num_maps
 
-    print(f"\nBus batteries after optimization:")
-    for lid, cap in sorted(bus_caps_kwh.items()):
-        print(f"  Line {lid}: {cap:.0f} kWh")
+        print("\n" + "-" * 70)
+        print(f"ADDITIONAL REFINEMENT PASS {refinement_pass}")
+        print("-" * 70)
+        print("Starting from the cheapest feasible values found so far:")
+        for lid, cap in sorted(current_bus_caps_kwh.items()):
+            print(f"  Line {lid}: {cap:.0f} kWh")
+        print(f"  MAP battery: {current_map_battery_kwh:.0f} kWh")
+        print(f"  Number of MAPs: {current_num_maps}")
 
-    # --- Phase 2: Tune MAP count ---
-    print("\n--- Phase 2: Tuning MAP count ---")
+        print("\n--- Phase 1: Reducing bus battery capacities ---")
+        current_bus_caps_kwh = _refine_bus_capacities(
+            sim=sim,
+            bus_trips=bus_trips,
+            bus_lines=bus_lines,
+            trip_change_stops=trip_change_stops,
+            bus_caps_kwh=current_bus_caps_kwh,
+            num_maps=current_num_maps,
+            default_bus_capacity_kwh=default_bus_capacity_kwh,
+            requested_map_battery_kwh=requested_map_battery_kwh,
+        )
 
-    baseline = _evaluate_config_cost(
-        sim=sim,
-        bus_trips=bus_trips,
-        bus_lines=bus_lines,
-        trip_change_stops=trip_change_stops,
-        bus_caps_kwh=bus_caps_kwh,
-        num_maps=num_maps,
-        default_bus_capacity_kwh=default_bus_capacity_kwh,
-        requested_map_battery_kwh=requested_map_battery_kwh,
-    )
-    if baseline is None:
-        print(" [WARN] Current configuration became infeasible - skipping Phase 2a.")
-        current_cost = float('inf')
-    else:
-        current_cost = baseline['total_cost']
-        print(f"Baseline cost at MAPs={num_maps}: ${current_cost:,.2f}")
+        print(f"\nBus batteries after optimization:")
+        for lid, cap in sorted(current_bus_caps_kwh.items()):
+            print(f"  Line {lid}: {cap:.0f} kWh")
 
-        # --- Phase 2a: Try MAPs+1 and re-run Phase 1 (accept if cheaper) ---
-        print("\n--- Phase 2a: Trying MAP increases (compensated by smaller bus batteries) ---")
-        while True:
-            trial_num_maps = num_maps + 1
-            test_map_battery = max(50, map_battery_kwh + 10)
-            print(f"\n Trying MAPs={trial_num_maps}: re-running Phase 1 to lower bus batteries...")
+        print("\n--- Phase 2: Tuning MAP count ---")
+        baseline = _evaluate_config_cost(
+            sim=sim,
+            bus_trips=bus_trips,
+            bus_lines=bus_lines,
+            trip_change_stops=trip_change_stops,
+            bus_caps_kwh=current_bus_caps_kwh,
+            num_maps=current_num_maps,
+            default_bus_capacity_kwh=default_bus_capacity_kwh,
+            requested_map_battery_kwh=requested_map_battery_kwh,
+        )
+        if baseline is None:
+            print(" [WARN] Current configuration became infeasible - skipping Phase 2a.")
+            current_cost = float('inf')
+        else:
+            current_cost = baseline['total_cost']
+            print(f"Baseline cost at MAPs={current_num_maps}: ${current_cost:,.2f}")
 
-            trial_bus_caps = _refine_bus_capacities(
+            print("\n--- Phase 2a: Trying MAP increases (compensated by smaller bus batteries) ---")
+            while True:
+                trial_num_maps = current_num_maps + 1
+                test_map_battery = max(50, current_map_battery_kwh + 10)
+                print(f"\n Trying MAPs={trial_num_maps}: re-running Phase 1 to lower bus batteries...")
+
+                trial_bus_caps = _refine_bus_capacities(
+                    sim=sim,
+                    bus_trips=bus_trips,
+                    bus_lines=bus_lines,
+                    trip_change_stops=trip_change_stops,
+                    bus_caps_kwh=current_bus_caps_kwh,
+                    num_maps=trial_num_maps,
+                    default_bus_capacity_kwh=default_bus_capacity_kwh,
+                    requested_map_battery_kwh=test_map_battery,
+                )
+
+                trial = _evaluate_config_cost(
+                    sim=sim,
+                    bus_trips=bus_trips,
+                    bus_lines=bus_lines,
+                    trip_change_stops=trip_change_stops,
+                    bus_caps_kwh=trial_bus_caps,
+                    num_maps=trial_num_maps,
+                    default_bus_capacity_kwh=default_bus_capacity_kwh,
+                    requested_map_battery_kwh=test_map_battery,
+                )
+
+                if trial is None:
+                    print(f"MAPs={trial_num_maps} infeasible at the reduced bus batteries; "
+                          f"abandoning Phase 2a.")
+                    break
+
+                trial_cost = trial['total_cost']
+                print(f"Trial cost (MAPs={trial_num_maps}): ${trial_cost:,.2f} "
+                      f"vs current ${current_cost:,.2f}")
+
+                if trial_cost < current_cost:
+                    print(f"Cheaper - accepting MAPs={trial_num_maps} with reduced bus batteries.")
+                    current_num_maps = trial_num_maps
+                    current_bus_caps_kwh = trial_bus_caps
+                    current_map_battery_kwh = test_map_battery
+                    requested_map_battery_kwh = test_map_battery
+                    current_cost = trial_cost
+                else:
+                    print("Not cheaper - falling back to decreasing-MAP logic.")
+                    break
+
+        print("\n--- Phase 2b: Reducing MAP count ---")
+        print(f"Current MAP count: {current_num_maps}")
+
+        while current_num_maps > 1:
+            test_num_maps = current_num_maps - 1
+            test_results, _ = run_terminal_charging_simulation(
                 sim=sim,
-                bus_trips=bus_trips,
+                bus_trips_dict=bus_trips,
                 bus_lines=bus_lines,
                 trip_change_stops=trip_change_stops,
-                bus_caps_kwh=bus_caps_kwh,
-                num_maps=trial_num_maps,
-                default_bus_capacity_kwh=default_bus_capacity_kwh,
-                requested_map_battery_kwh=test_map_battery,
+                battery_capacity_wh=int(default_bus_capacity_kwh * 1000),
+                num_maps=test_num_maps,
+                optimize_threshold=True,
+                preemption_threshold=None,
+                simulation_duration_s=86400,
+                line_battery_capacities_wh={lid: int(cap * 1000) for lid, cap in current_bus_caps_kwh.items()},
+                map_battery_capacity_wh=int(requested_map_battery_kwh * 1000),
+                skip_plots=True,
             )
 
-            trial = _evaluate_config_cost(
-                sim=sim,
-                bus_trips=bus_trips,
-                bus_lines=bus_lines,
-                trip_change_stops=trip_change_stops,
-                bus_caps_kwh=trial_bus_caps,
-                num_maps=trial_num_maps,
-                default_bus_capacity_kwh=default_bus_capacity_kwh,
-                requested_map_battery_kwh=test_map_battery,
-            )
-
-            if trial is None:
-                print(f"✗ MAPs={trial_num_maps} infeasible at the reduced bus batteries; "
-                      f"abandoning Phase 2a.")
-                break
-
-            trial_cost = trial['total_cost']
-            print(f"Trial cost (MAPs={trial_num_maps}): ${trial_cost:,.2f} "
-                  f"vs current ${current_cost:,.2f}")
-
-            if trial_cost < current_cost:
-                print(f"✓ Cheaper - accepting MAPs={trial_num_maps} with reduced bus batteries.")
-                num_maps = trial_num_maps
-                bus_caps_kwh = trial_bus_caps
-                current_cost = trial_cost
-                # Try another +1
+            if test_results['feasible']:
+                current_num_maps = test_num_maps
+                print(f"  Reduced to {current_num_maps} MAPs - still feasible")
             else:
-                print(f"✗ Not cheaper - falling back to decreasing-MAP logic.")
+                print(f"  Cannot reduce below {current_num_maps} MAPs - infeasible at {test_num_maps} MAPs")
                 break
 
-    # --- Phase 2b: Reduce MAP count ---
-    print("\n--- Phase 2b: Reducing MAP count ---")
-    print(f"Current MAP count: {num_maps}")
+        print(f"MAP count after optimization: {current_num_maps}")
 
-    while num_maps > 1:  # Minimum 1 MAP
-        test_num_maps = num_maps - 1
-        test_results, _ = run_terminal_charging_simulation(
-            sim=sim,
-            bus_trips_dict=bus_trips,
-            bus_lines=bus_lines,
-            trip_change_stops=trip_change_stops,
-            battery_capacity_wh=int(default_bus_capacity_kwh * 1000),
-            num_maps=test_num_maps,
-            optimize_threshold=True,
-            preemption_threshold=None,
-            simulation_duration_s=86400,
-            line_battery_capacities_wh={lid: int(cap * 1000) for lid, cap in bus_caps_kwh.items()},
-            map_battery_capacity_wh=(None if requested_map_battery_kwh is None
-                                     else int(requested_map_battery_kwh * 1000)),
-            skip_plots=True,
+        print("\n--- Phase 3: Reducing MAP battery capacity ---")
+        print(f"Current MAP battery: {current_map_battery_kwh:.0f} kWh")
+
+        while current_map_battery_kwh > 50:
+            test_map_battery = max(50, current_map_battery_kwh - 10)
+            test_results, _ = run_terminal_charging_simulation(
+                sim=sim,
+                bus_trips_dict=bus_trips,
+                bus_lines=bus_lines,
+                trip_change_stops=trip_change_stops,
+                battery_capacity_wh=int(default_bus_capacity_kwh * 1000),
+                num_maps=current_num_maps,
+                optimize_threshold=True,
+                preemption_threshold=None,
+                simulation_duration_s=86400,
+                line_battery_capacities_wh={lid: int(cap * 1000) for lid, cap in current_bus_caps_kwh.items()},
+                map_battery_capacity_wh=int(test_map_battery * 1000),
+                skip_plots=True,
+            )
+
+            if test_results['feasible']:
+                current_map_battery_kwh = test_map_battery
+                requested_map_battery_kwh = test_map_battery
+                print(f"  Reduced to {current_map_battery_kwh:.0f} kWh - still feasible")
+            else:
+                print(f"  Cannot reduce below {current_map_battery_kwh:.0f} kWh - infeasible at {test_map_battery:.0f} kWh")
+                break
+
+        print(f"MAP battery after optimization: {current_map_battery_kwh:.0f} kWh")
+
+        changed = _refinement_config_changed(
+            pass_start_bus_caps_kwh,
+            pass_start_map_battery_kwh,
+            pass_start_num_maps,
+            current_bus_caps_kwh,
+            current_map_battery_kwh,
+            current_num_maps,
         )
 
-        if test_results['feasible']:
-            num_maps = test_num_maps
-            print(f"  ✓ Reduced to {num_maps} MAPs - still feasible")
-        else:
-            print(f"  ✗ Cannot reduce below {num_maps} MAPs - infeasible at {test_num_maps} MAPs")
+        if not changed:
+            print("\nAdditional refinement pass did not change the solution.")
             break
 
-    print(f"MAP count after optimization: {num_maps}")
+        print("\nAdditional refinement pass changed the solution; running another pass.")
+    else:
+        print(f"\n[WARN] Reached maximum additional refinement passes ({max_refinement_passes}).")
 
-    # --- Phase 3: Reduce MAP battery capacity ---
-    print("\n--- Phase 3: Reducing MAP battery capacity ---")
-    print(f"Current MAP battery: {map_battery_kwh:.0f} kWh")
+    final_results, final_stage2_sim = run_terminal_charging_simulation(
+        sim=sim,
+        bus_trips_dict=bus_trips,
+        bus_lines=bus_lines,
+        trip_change_stops=trip_change_stops,
+        battery_capacity_wh=int(default_bus_capacity_kwh * 1000),
+        num_maps=current_num_maps,
+        optimize_threshold=True,
+        preemption_threshold=None,
+        simulation_duration_s=86400,
+        line_battery_capacities_wh={lid: int(cap * 1000) for lid, cap in current_bus_caps_kwh.items()},
+        map_battery_capacity_wh=int(current_map_battery_kwh * 1000),
+        skip_plots=True,
+    )
 
-    while map_battery_kwh > 50:  # Minimum 50 kWh
-        test_map_battery = max(50, map_battery_kwh - 10)
-        test_results, _ = run_terminal_charging_simulation(
+    current_map_battery_kwh = resolve_map_battery_kwh(
+        final_results, final_stage2_sim,
+        requested_map_battery_kwh=current_map_battery_kwh)
+
+    return (current_bus_caps_kwh, current_num_maps, current_map_battery_kwh,
+            final_results, final_stage2_sim)
+
+
+def run_random_restarts(sim, bus_trips, bus_lines, trip_change_stops,
+                        num_runs=2, max_iterations=50):
+    all_runs = []
+    best_overall = None
+
+    for run_idx in range(1, num_runs + 1):
+        print("\n" + "=" * 70)
+        print(f"RANDOM RESTART {run_idx}/{num_runs}")
+        print("=" * 70)
+
+        (
+            line_battery_capacities_wh,
+            initial_capacity_wh,
+            initial_num_maps,
+            map_battery_capacity_wh,
+        ) = generate_random_initial_values(bus_lines)
+
+        print("\nRandom initial values:")
+        for lid, wh in sorted(line_battery_capacities_wh.items()):
+            print(f"  Line {lid}: {wh / 1000:.0f} kWh")
+        print(f"  Default bus battery: {initial_capacity_wh / 1000:.0f} kWh")
+        print(f"  Number of MAPs: {initial_num_maps}")
+        print(f"  MAP battery: {map_battery_capacity_wh / 1000:.0f} kWh")
+
+        solution, sim_results, stage2_sim, log = run_milp_simulation_loop(
             sim=sim,
-            bus_trips_dict=bus_trips,
+            bus_trips=bus_trips,
             bus_lines=bus_lines,
             trip_change_stops=trip_change_stops,
-            battery_capacity_wh=int(default_bus_capacity_kwh * 1000),
-            num_maps=num_maps,
-            optimize_threshold=True,
-            preemption_threshold=None,
-            simulation_duration_s=86400,
-            line_battery_capacities_wh={lid: int(cap * 1000) for lid, cap in bus_caps_kwh.items()},
-            map_battery_capacity_wh=int(test_map_battery * 1000),
-            skip_plots=True,
+            line_battery_capacities_wh=line_battery_capacities_wh,
+            initial_capacity_wh=initial_capacity_wh,
+            initial_num_maps=initial_num_maps,
+            initial_map_battery_wh=map_battery_capacity_wh,
+            max_iterations=max_iterations,
         )
 
-        if test_results['feasible']:
-            map_battery_kwh = test_map_battery
-            requested_map_battery_kwh = test_map_battery
-            print(f"  ✓ Reduced to {map_battery_kwh:.0f} kWh - still feasible")
-        else:
-            print(f"  ✗ Cannot reduce below {map_battery_kwh:.0f} kWh - infeasible at {test_map_battery:.0f} kWh")
-            break
+        run_record = {
+            "run": run_idx,
+            "initial_line_battery_kwh": {
+                lid: wh / 1000.0 for lid, wh in line_battery_capacities_wh.items()
+            },
+            "initial_capacity_kwh": initial_capacity_wh / 1000.0,
+            "initial_num_maps": initial_num_maps,
+            "initial_map_battery_kwh": map_battery_capacity_wh / 1000.0,
+            "solution": solution,
+            "sim_results": sim_results,
+            "log": log,
+        }
 
-    print(f"MAP battery after optimization: {map_battery_kwh:.0f} kWh")
+        if solution:
+            cost_result = calculate_system_cost(
+                bus_caps_kwh=solution["bus_battery_kwh"],
+                num_maps=solution["num_maps"],
+                map_battery_kwh=solution["map_battery_kwh"],
+                sim_results=sim_results,
+                bus_lines=bus_lines,
+            )
+            run_record["total_cost"] = cost_result["total_cost"]
 
-    return bus_caps_kwh, num_maps, map_battery_kwh, requested_map_battery_kwh
+            if best_overall is None or cost_result["total_cost"] < best_overall["total_cost"]:
+                best_overall = run_record
 
+        all_runs.append(run_record)
+
+    return all_runs, best_overall
 
 def run_milp_simulation_loop(sim, bus_trips, bus_lines, trip_change_stops,
                              line_battery_capacities_wh,
                              initial_capacity_wh, initial_num_maps,
+                             initial_map_battery_wh=None,
                              max_iterations=100):
     """
     Iterative constraint-driven feasibility search (no MILP optimization).
@@ -773,8 +898,10 @@ def run_milp_simulation_loop(sim, bus_trips, bus_lines, trip_change_stops,
     # Track current capacities (start with user-provided values)
     current_bus_caps_kwh = {lid: wh / 1000.0 for lid, wh in line_battery_capacities_wh.items()}
     default_bus_capacity_kwh = initial_capacity_wh / 1000.0
-    # MAP battery is simulation-driven; None means use integration default
-    requested_map_battery_kwh = None
+    # MAP battery is simulation-driven; None means use integration default.
+    requested_map_battery_kwh = (
+        None if initial_map_battery_wh is None else initial_map_battery_wh / 1000.0
+    )
     current_map_battery_kwh = None
     current_num_maps = initial_num_maps
     last_action = None  # Track last action to enforce alternation: 'bus' or 'map'
@@ -789,7 +916,10 @@ def run_milp_simulation_loop(sim, bus_trips, bus_lines, trip_change_stops,
     for lid, cap in sorted(current_bus_caps_kwh.items()):
         print(f"    Line {lid} bus battery: {cap:.0f} kWh")
     print(f"    Default bus battery: {default_bus_capacity_kwh:.0f} kWh")
-    print("    MAP battery: SIMULATION DEFAULT")
+    if requested_map_battery_kwh is None:
+        print("    MAP battery: SIMULATION DEFAULT")
+    else:
+        print(f"    MAP battery: {requested_map_battery_kwh:.0f} kWh")
     print(f"    Number of MAPs: {current_num_maps}")
 
     results, stage2_sim = run_terminal_charging_simulation(
@@ -955,6 +1085,9 @@ def run_milp_simulation_loop(sim, bus_trips, bus_lines, trip_change_stops,
         current_map_battery_kwh = best_feasible['map_battery_kwh']
         requested_map_battery_kwh = current_map_battery_kwh
         current_num_maps = best_feasible['num_maps']
+        initial_refinement_bus_caps_kwh = current_bus_caps_kwh.copy()
+        initial_refinement_map_battery_kwh = current_map_battery_kwh
+        initial_refinement_num_maps = current_num_maps
 
         # --- Phase 1: Reduce bus battery capacities per line ---
         print("\n--- Phase 1: Reducing bus battery capacities ---")
@@ -1038,6 +1171,8 @@ def run_milp_simulation_loop(sim, bus_trips, bus_lines, trip_change_stops,
                     print(f"✓ Cheaper - accepting MAPs={trial_num_maps} with reduced bus batteries.")
                     current_num_maps = trial_num_maps
                     current_bus_caps_kwh = trial_bus_caps
+                    current_map_battery_kwh = test_map_battery
+                    requested_map_battery_kwh = test_map_battery
                     current_cost = trial_cost
                     # Try another +1
                 else:
@@ -1135,6 +1270,35 @@ def run_milp_simulation_loop(sim, bus_trips, bus_lines, trip_change_stops,
         )
         current_map_battery_kwh = resolve_map_battery_kwh(
             final_results, final_stage2_sim, requested_map_battery_kwh=requested_map_battery_kwh)
+        if _refinement_config_changed(
+                initial_refinement_bus_caps_kwh,
+                initial_refinement_map_battery_kwh,
+                initial_refinement_num_maps,
+                current_bus_caps_kwh,
+                current_map_battery_kwh,
+                current_num_maps):
+            print("\nRefinement changed the original feasible solution.")
+            print("Running Phases 1-3 again from the cheapest feasible values found.")
+            (current_bus_caps_kwh,
+             current_num_maps,
+             current_map_battery_kwh,
+             final_results,
+             final_stage2_sim) = _run_additional_refinement_passes(
+                sim=sim,
+                bus_trips=bus_trips,
+                bus_lines=bus_lines,
+                trip_change_stops=trip_change_stops,
+                bus_caps_kwh=current_bus_caps_kwh,
+                num_maps=current_num_maps,
+                map_battery_kwh=current_map_battery_kwh,
+                default_bus_capacity_kwh=default_bus_capacity_kwh,
+            )
+            requested_map_battery_kwh = current_map_battery_kwh
+        else:
+            print("\nRefinement did not change the original feasible solution.")
+
+        best_feasible['bus_battery_kwh'] = current_bus_caps_kwh
+        best_feasible['num_maps'] = current_num_maps
         best_feasible['map_battery_kwh'] = current_map_battery_kwh
         best_feasible['sim_results'] = final_results
         best_feasible['stage2_sim'] = final_stage2_sim
@@ -1191,16 +1355,16 @@ def run_milp_simulation_loop(sim, bus_trips, bus_lines, trip_change_stops,
     print()
 
     # --- Generate plots only for the best feasible solution ---
-    if best_feasible:
-        print("Generating plots for the feasible solution "
-              f"(iteration {best_feasible['iteration']})...")
-        optimal_sim = best_feasible['stage2_sim']
-        optimal_sim.plot_soc(save_path="bus_soc_terminal_charging_optimized.png")
-        optimal_sim.plot_map_energy_delivery(save_path="map_energy_delivery.png")
-        optimal_sim.plot_cumulative_energy_delivery(save_path="cumulative_energy_delivery.png")
-        optimal_sim.plot_map_movement(save_path="map_movement_distance.png")
-        optimal_sim.plot_map_soc(save_path="map_soc_over_time.png")
-        optimal_sim.plot_map_self_charge_heatmap(save_path="map_self_charge_heatmap.png")
+    # if best_feasible:
+    #     print("Generating plots for the feasible solution "
+    #           f"(iteration {best_feasible['iteration']})...")
+    #     optimal_sim = best_feasible['stage2_sim']
+    #     optimal_sim.plot_soc(save_path="bus_soc_terminal_charging_optimized.png")
+    #     optimal_sim.plot_map_energy_delivery(save_path="map_energy_delivery.png")
+    #     optimal_sim.plot_cumulative_energy_delivery(save_path="cumulative_energy_delivery.png")
+    #     optimal_sim.plot_map_movement(save_path="map_movement_distance.png")
+    #     optimal_sim.plot_map_soc(save_path="map_soc_over_time.png")
+    #     optimal_sim.plot_map_self_charge_heatmap(save_path="map_self_charge_heatmap.png")
 
     if best_feasible:
         return best_feasible, best_feasible['sim_results'], best_feasible['stage2_sim'], iteration_log
@@ -1246,21 +1410,21 @@ def main():
         return
 
     # Per-line battery capacities (kWh)
-    LINE_BATTERY_CAPACITIES_KWH = {
-        "1": 90,
-        "2": 60,
-        "3": 90,
-        "4": 120,
-        "6": 70,
-    }
-    # Convert to Wh for the simulation
-    line_battery_capacities_wh = {
-        lid: cap * 1000 for lid, cap in LINE_BATTERY_CAPACITIES_KWH.items()
-    }
+    # LINE_BATTERY_CAPACITIES_KWH = {
+    #     "1": 150,
+    #     "2": 150,
+    #     "3": 150,
+    #     "4": 150,
+    #     "6": 150,
+    # }
+    # # Convert to Wh for the simulation
+    # line_battery_capacities_wh = {
+    #     lid: cap * 1000 for lid, cap in LINE_BATTERY_CAPACITIES_KWH.items()
+    # }
 
     # Default fallback capacity and initial MAP count
     initial_capacity_wh = 140 * 1000
-    initial_num_maps = 9
+    # initial_num_maps = 9
 
     if simulation_only:
         # ---- Simulation-only mode ----
@@ -1311,25 +1475,66 @@ def main():
         print("\n" + "=" * 70)
         print("CONSTRAINT-DRIVEN FEASIBILITY SEARCH")
         print("=" * 70)
-
-        solution, sim_results, stage2_sim, log = run_milp_simulation_loop(
+##COmment out for running code once
+        # solution, sim_results, stage2_sim, log = run_milp_simulation_loop(
+        #     sim=sim,
+        #     bus_trips=bus_trips,
+        #     bus_lines=bus_lines,
+        #     trip_change_stops=trip_change_stops,
+        #     line_battery_capacities_wh=line_battery_capacities_wh,
+        #     initial_capacity_wh=initial_capacity_wh,
+        #     initial_num_maps=initial_num_maps,
+        #     max_iterations=50,
+        # )
+        ## COmment out for running multiple runs with random values
+        all_runs, best_run = run_random_restarts(
             sim=sim,
             bus_trips=bus_trips,
             bus_lines=bus_lines,
             trip_change_stops=trip_change_stops,
-            line_battery_capacities_wh=line_battery_capacities_wh,
-            initial_capacity_wh=initial_capacity_wh,
-            initial_num_maps=initial_num_maps,
+            num_runs=20,
             max_iterations=50,
         )
 
         # Final summary
         print("\n" + "=" * 70)
-        print("FINAL RESULTS")
+        print("RANDOM RESTART RESULTS")
         print("=" * 70)
 
-        if solution:
-            print(f"\nFeasible Solution Found!")
+        if all_runs:
+            for run_record in all_runs:
+                print("\n" + "-" * 70)
+                print(f"Random restart {run_record['run']}")
+
+                solution = run_record.get("solution")
+                sim_results = run_record.get("sim_results")
+
+                if not solution:
+                    print("  No feasible solution found.")
+                    continue
+
+                print(f"  Total cost: ${run_record['total_cost']:,.2f}")
+                print(f"  Number of MAPs: {solution['num_maps']}")
+                print(f"  MAP battery: {solution['map_battery_kwh']:.0f} kWh")
+                if sim_results:
+                    print(f"  Min SOC: {sim_results['min_soc_overall_ratio'] * 100:.1f}%")
+
+                bus_caps = ", ".join(
+                    f"L{lid}:{cap:.0f} kWh"
+                    for lid, cap in sorted(solution['bus_battery_kwh'].items())
+                )
+                print(f"  Bus batteries: {bus_caps}")
+
+        print("\n" + "=" * 70)
+        print("CHEAPEST SOLUTION FROM ALL RANDOM RUNS")
+        print("=" * 70)
+
+        if best_run:
+            solution = best_run["solution"]
+            sim_results = best_run["sim_results"]
+
+            print(f"\nBest random run: {best_run['run']}")
+            print(f"Total cost: ${best_run['total_cost']:,.2f}")
             print(f"Number of MAPs: {solution['num_maps']}")
             print(f"MAP battery: {solution['map_battery_kwh']:.0f} kWh")
             print("\nBus battery capacities (per line):")
@@ -1345,10 +1550,10 @@ def main():
                 map_battery_kwh=solution['map_battery_kwh'],
                 sim_results=sim_results,
                 bus_lines=bus_lines,
-                label=f"Feasible Solution (iteration {solution['iteration']})",
+                label=f"Cheapest Random Run {best_run['run']}",
             )
         else:
-            print("\nNo feasible solution found within maximum iterations.")
+            print("\nNo feasible solution found in any random run.")
 
         print(f"\n{'=' * 70}\n")
 
