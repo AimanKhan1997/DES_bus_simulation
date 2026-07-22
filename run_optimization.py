@@ -7,13 +7,11 @@ Modes:
 """
 
 from integration_stage2 import run_terminal_charging_simulation
-# from post_simulation_milp import post_simulation_optimize
+#from post_simulation_milp import post_simulation_optimize
 from dataclasses import dataclass
 import math
 import sys
 import random
-import json
-import os
 
 
 @dataclass
@@ -215,6 +213,7 @@ def resolve_map_battery_kwh(results, stage2_sim, requested_map_battery_kwh=None)
     return actual_kwh
 
 
+
 def load_stockholm_data():
     from DES_model import GTFSBusSim
     from Trip_assign import load_trips
@@ -281,8 +280,8 @@ def compute_trip_change_stops(sim, bus_trips_dict):
     return trip_change_stops
 
 
-def generate_random_initial_values(bus_lines, min_bus_cap_kwh=140, max_bus_cap_kwh=150,
-                                   min_maps=10, max_maps=13, min_map_cap_kwh=250,
+def generate_random_initial_values(bus_lines, min_bus_cap_kwh=50, max_bus_cap_kwh=200,
+                                   min_maps=4, max_maps=13, min_map_cap_kwh=200,
                                    max_map_cap_kwh=450):
     """
     Generate random initial values for LINE_BATTERY_CAPACITIES_KWH, number of MAPs,
@@ -488,7 +487,6 @@ def select_single_constraint_for_alternation(new_constraints, last_action=None):
         return [strongest_map_cap], remaining, 'map'
 
     return [], [], None
-
 
 def _refine_bus_capacities(sim, bus_trips, bus_lines, trip_change_stops,
                            bus_caps_kwh, num_maps, default_bus_capacity_kwh,
@@ -761,8 +759,7 @@ def _run_additional_refinement_passes(sim, bus_trips, bus_lines, trip_change_sto
                 requested_map_battery_kwh = test_map_battery
                 print(f"  Reduced to {current_map_battery_kwh:.0f} kWh - still feasible")
             else:
-                print(
-                    f"  Cannot reduce below {current_map_battery_kwh:.0f} kWh - infeasible at {test_map_battery:.0f} kWh")
+                print(f"  Cannot reduce below {current_map_battery_kwh:.0f} kWh - infeasible at {test_map_battery:.0f} kWh")
                 break
 
         print(f"MAP battery after optimization: {current_map_battery_kwh:.0f} kWh")
@@ -873,7 +870,6 @@ def run_random_restarts(sim, bus_trips, bus_lines, trip_change_stops,
 
     return all_runs, best_overall
 
-
 def run_milp_simulation_loop(sim, bus_trips, bus_lines, trip_change_stops,
                              line_battery_capacities_wh,
                              initial_capacity_wh, initial_num_maps,
@@ -947,16 +943,6 @@ def run_milp_simulation_loop(sim, bus_trips, bus_lines, trip_change_stops,
     print(f"\n  Simulation feasibility: {'FEASIBLE [OK]' if results['feasible'] else 'INFEASIBLE [X]'}")
     print(f"  Min SOC ratio: {results['min_soc_overall_ratio'] * 100:.1f}%")
 
-    # Calculate cost for iteration 0
-    cost_result = calculate_system_cost(
-        bus_caps_kwh=current_bus_caps_kwh,
-        num_maps=current_num_maps,
-        map_battery_kwh=current_map_battery_kwh,
-        sim_results=results,
-        bus_lines=bus_lines,
-    )
-    total_cost_iter0 = cost_result['total_cost']
-
     if results['feasible']:
         best_feasible = {
             'sim_results': results,
@@ -975,7 +961,6 @@ def run_milp_simulation_loop(sim, bus_trips, bus_lines, trip_change_stops,
         'bus_battery_kwh': current_bus_caps_kwh.copy(),
         'map_battery_kwh': current_map_battery_kwh,
         'num_maps': current_num_maps,
-        'total_cost': total_cost_iter0,
         'constraints_applied': [],
         'constraints_deferred': [],
         'last_action': last_action,
@@ -1009,7 +994,6 @@ def run_milp_simulation_loop(sim, bus_trips, bus_lines, trip_change_stops,
                     'bus_battery_kwh': current_bus_caps_kwh.copy(),
                     'map_battery_kwh': current_map_battery_kwh,
                     'num_maps': current_num_maps,
-                    'total_cost': float('inf'),
                     'constraints_applied': [],
                 })
                 continue
@@ -1064,16 +1048,6 @@ def run_milp_simulation_loop(sim, bus_trips, bus_lines, trip_change_stops,
         print(f"\n  Simulation feasibility: {'FEASIBLE [OK]' if results['feasible'] else 'INFEASIBLE [X]'}")
         print(f"  Min SOC ratio: {results['min_soc_overall_ratio'] * 100:.1f}%")
 
-        # Calculate cost for this iteration
-        cost_result = calculate_system_cost(
-            bus_caps_kwh=current_bus_caps_kwh,
-            num_maps=current_num_maps,
-            map_battery_kwh=current_map_battery_kwh,
-            sim_results=results,
-            bus_lines=bus_lines,
-        )
-        total_cost_iter = cost_result['total_cost']
-
         if results['feasible']:
             best_feasible = {
                 'sim_results': results,
@@ -1092,7 +1066,6 @@ def run_milp_simulation_loop(sim, bus_trips, bus_lines, trip_change_stops,
             'bus_battery_kwh': current_bus_caps_kwh.copy(),
             'map_battery_kwh': current_map_battery_kwh,
             'num_maps': current_num_maps,
-            'total_cost': total_cost_iter,
             'constraints_applied': constraints_applied,
         })
 
@@ -1269,8 +1242,7 @@ def run_milp_simulation_loop(sim, bus_trips, bus_lines, trip_change_stops,
                 requested_map_battery_kwh = test_map_battery
                 print(f"  ✓ Reduced to {current_map_battery_kwh:.0f} kWh - still feasible")
             else:
-                print(
-                    f"  ✗ Cannot reduce below {current_map_battery_kwh:.0f} kWh - infeasible at {test_map_battery:.0f} kWh")
+                print(f"  ✗ Cannot reduce below {current_map_battery_kwh:.0f} kWh - infeasible at {test_map_battery:.0f} kWh")
                 break
 
         print(f"MAP battery after optimization: {current_map_battery_kwh:.0f} kWh")
@@ -1345,14 +1317,12 @@ def run_milp_simulation_loop(sim, bus_trips, bus_lines, trip_change_stops,
     print("\n" + "=" * 70)
     print("CONSTRAINT-DRIVEN SEARCH SUMMARY")
     print("=" * 70)
-    print(f"\n{'Iter':<6} {'Method':<18} {'Feasible':<10} {'Action':<8} {'MAPs':>6} {'MAP kWh':>9} {'Cost':>15}")
-    print("-" * 90)
+    print(f"\n{'Iter':<6} {'Method':<18} {'Feasible':<10} {'Action':<8} {'MAPs':>6} {'MAP kWh':>9}")
+    print("-" * 70)
     for entry in iteration_log:
         feas = "Y" if entry.get('sim_feasible') else "N"
         maps = str(entry.get('num_maps', '-')) if entry.get('num_maps') is not None else '-'
         map_kwh = f"{entry['map_battery_kwh']:.0f}" if entry.get('map_battery_kwh') is not None else '-'
-        total_cost = entry.get('total_cost', float('inf'))
-        cost_str = f"${total_cost:,.0f}" if total_cost != float('inf') else "-"
         action = entry.get('last_action') or ''
         if action == 'bus':
             action = 'BUS↑'
@@ -1364,7 +1334,7 @@ def run_milp_simulation_loop(sim, bus_trips, bus_lines, trip_change_stops,
                                     and entry.get('sim_feasible')
                                     and entry.get('iteration') == best_feasible['iteration']) else ""
         print(
-            f"{entry['iteration']:<6} {entry.get('method', ''):<18} {feas:<10} {action:<8} {maps:>6} {map_kwh:>9} {cost_str:>15}{best_mark}")
+            f"{entry['iteration']:<6} {entry.get('method', ''):<18} {feas:<10} {action:<8} {maps:>6} {map_kwh:>9}{best_mark}")
 
         # Print bus battery capacities for this iteration
         bus_caps = entry.get('bus_battery_kwh')
@@ -1384,71 +1354,22 @@ def run_milp_simulation_loop(sim, bus_trips, bus_lines, trip_change_stops,
                 print(f"  (pending) {constraint_reason}")
     print()
 
+    # --- Generate plots only for the best feasible solution ---
+    # if best_feasible:
+    #     print("Generating plots for the feasible solution "
+    #           f"(iteration {best_feasible['iteration']})...")
+    #     optimal_sim = best_feasible['stage2_sim']
+    #     optimal_sim.plot_soc(save_path="bus_soc_terminal_charging_optimized.png")
+    #     optimal_sim.plot_map_energy_delivery(save_path="map_energy_delivery.png")
+    #     optimal_sim.plot_cumulative_energy_delivery(save_path="cumulative_energy_delivery.png")
+    #     optimal_sim.plot_map_movement(save_path="map_movement_distance.png")
+    #     optimal_sim.plot_map_soc(save_path="map_soc_over_time.png")
+    #     optimal_sim.plot_map_self_charge_heatmap(save_path="map_self_charge_heatmap.png")
+
     if best_feasible:
         return best_feasible, best_feasible['sim_results'], best_feasible['stage2_sim'], iteration_log
     else:
         return None, results, stage2_sim, iteration_log
-
-
-def export_runs_to_json(all_runs, filename='optimization_runs.json'):
-    """
-    Export all_runs to JSON for plotting.
-    Keeps only necessary fields for plotting: log data with costs, configs, feasibility.
-    Filters out non-serializable objects like stage2_sim.
-    """
-    export_data = []
-    for run in all_runs:
-        # Build iteration log with only JSON-serializable fields
-        filtered_iteration_log = []
-        for entry in run.get('log', []):
-            filtered_entry = {
-                'iteration': entry.get('iteration'),
-                'method': entry.get('method'),
-                'sim_feasible': entry.get('sim_feasible'),
-                'bus_battery_kwh': entry.get('bus_battery_kwh'),
-                'map_battery_kwh': entry.get('map_battery_kwh'),
-                'num_maps': entry.get('num_maps'),
-                'total_cost': entry.get('total_cost'),
-                'constraints_applied': entry.get('constraints_applied', []),
-            }
-            filtered_iteration_log.append(filtered_entry)
-
-        # Extract solution (only serializable parts)
-        solution = run.get('solution')
-        solution_export = None
-        if solution:
-            solution_export = {
-                'bus_battery_kwh': solution.get('bus_battery_kwh'),
-                'map_battery_kwh': solution.get('map_battery_kwh'),
-                'num_maps': solution.get('num_maps'),
-            }
-
-        # Extract sim_results (only serializable parts)
-        sim_results = run.get('sim_results')
-        sim_results_export = None
-        if sim_results:
-            sim_results_export = {
-                'feasible': sim_results.get('feasible'),
-                'min_soc_overall_ratio': sim_results.get('min_soc_overall_ratio'),
-            }
-
-        run_export = {
-            'run': run['run'],
-            'initial_line_battery_kwh': run['initial_line_battery_kwh'],
-            'initial_num_maps': run['initial_num_maps'],
-            'initial_map_battery_kwh': run['initial_map_battery_kwh'],
-            'total_cost': run.get('total_cost'),
-            'solution': solution_export,
-            'sim_results': sim_results_export,
-            'iteration_log': filtered_iteration_log,
-        }
-        export_data.append(run_export)
-
-    with open(filename, 'w') as f:
-        json.dump(export_data, f, indent=2, default=str)
-
-    print(f"\n[EXPORT] Optimization runs exported to {filename}")
-    return filename
 
 
 def main():
@@ -1554,7 +1475,7 @@ def main():
         print("\n" + "=" * 70)
         print("CONSTRAINT-DRIVEN FEASIBILITY SEARCH")
         print("=" * 70)
-        ##COmment out for running code once
+##COmment out for running code once
         # solution, sim_results, stage2_sim, log = run_milp_simulation_loop(
         #     sim=sim,
         #     bus_trips=bus_trips,
@@ -1571,12 +1492,9 @@ def main():
             bus_trips=bus_trips,
             bus_lines=bus_lines,
             trip_change_stops=trip_change_stops,
-            num_runs=1,
+            num_runs=20,
             max_iterations=50,
         )
-
-        # Export all_runs to JSON for plotting
-        export_runs_to_json(all_runs, filename='optimization_runs.json')
 
         # Final summary
         print("\n" + "=" * 70)
@@ -1638,7 +1556,6 @@ def main():
             print("\nNo feasible solution found in any random run.")
 
         print(f"\n{'=' * 70}\n")
-
 
 if __name__ == "__main__":
     main()
